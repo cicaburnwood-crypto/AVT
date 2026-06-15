@@ -1,6 +1,6 @@
 # AVT
 
-Any - Video - Trainning - Navigation
+Any - Video - Trainning - Databuild and process toolkit
 
 AVT is a standalone inverse-video point tracking and WebUI visualization toolkit.
 It was extracted so the tracking model, inverse tracking pipeline, and viewer are
