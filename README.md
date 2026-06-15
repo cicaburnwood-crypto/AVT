@@ -31,7 +31,6 @@ Run the whole pipeline on an image folder, Earth Rover recording folder with
 avt all \
   --frames-root /path/to/recording_or_images \
   --source-type auto \
-  --output-root outputs/example \
   --backend cotracker \
   --cotracker-device cuda \
   --window-size 250 \
@@ -46,7 +45,6 @@ For a quick CPU smoke test without CoTracker:
 avt all \
   --frames-root /path/to/images \
   --source-type image_dir \
-  --output-root outputs/smoke \
   --backend lk \
   --window-size 40 \
   --window-step 20 \
@@ -54,10 +52,16 @@ avt all \
   --max-windows 1
 ```
 
+By default, each CLI run writes into a fresh child directory under
+`/home/wolfie/Project/Cyber_Guider/AVT/outputs`, for example
+`/home/wolfie/Project/Cyber_Guider/AVT/outputs/run_20260615_120501_123456`.
+Pass `--output-root` to use a different base directory. The command prints the
+resolved `output_root` and viewer path when it finishes.
+
 Serve the generated viewer:
 
 ```bash
-python -m http.server 8780 -d outputs/example/viewer
+python -m http.server 8780 -d /home/wolfie/Project/Cyber_Guider/AVT/outputs/run_20260615_120501_123456/viewer
 ```
 
 Open `http://127.0.0.1:8780/`.
@@ -69,23 +73,27 @@ The viewer does not import or call CoTracker. It only reads AVT artifacts:
 ```bash
 avt viewer \
   --frames-root /path/to/recording_or_images \
-  --tracking-root outputs/example \
-  --viewer-dir outputs/example/viewer
+  --tracking-root /home/wolfie/Project/Cyber_Guider/AVT/outputs/run_20260615_120501_123456
 ```
+
+The viewer command also writes a fresh child directory under its output base.
+By default that base is `/home/wolfie/Project/Cyber_Guider/AVT/outputs/viewer_runs`;
+pass `--viewer-dir` to use a different base directory.
 
 ## Output Format
 
-Each tracked window is written to:
+Each CLI run creates a unique run directory. Each tracked window is written to:
 
 ```text
-outputs/example/
-  run.json
-  windows/
-    seq_000_250/
-      window.json
-      tracks.npz
-      path_mask_reference.png
-      reverse_video.mp4
+/home/wolfie/Project/Cyber_Guider/AVT/outputs/
+  run_20260615_120501_123456/
+    run.json
+    windows/
+      seq_000_250/
+        window.json
+        tracks.npz
+        path_mask_reference.png
+        reverse_video.mp4
 ```
 
 `tracks.npz` contains:

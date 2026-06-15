@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 
@@ -8,6 +9,24 @@ from .inverse import InverseTrackConfig, run_inverse_tracking
 from .io import read_frame_records
 from .tracking import LKTracker
 from .viewer import build_viewer
+
+
+DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs"
+DEFAULT_VIEWER_ROOT = DEFAULT_OUTPUT_ROOT / "viewer_runs"
+
+
+def _create_unique_run_dir(base: Path, preferred_name: str | None = None) -> Path:
+    base.mkdir(parents=True, exist_ok=True)
+    stem = preferred_name or f"run_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    for attempt in range(100):
+        name = stem if attempt == 0 else f"{stem}_{attempt:02d}"
+        candidate = base / name
+        try:
+            candidate.mkdir()
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError(f"Could not create a unique run directory under {base}")
 
 
 def _add_source_args(parser: argparse.ArgumentParser) -> None:
@@ -67,24 +86,35 @@ def _tracker_from_args(args: argparse.Namespace):
 def cmd_track(args: argparse.Namespace) -> int:
     records = read_frame_records(args.frames_root, args.source_type)
     tracker = _tracker_from_args(args)
+    output_root = _create_unique_run_dir(args.output_root)
     windows = run_inverse_tracking(
         source_root=args.frames_root,
         frame_records=records,
-        output_dir=args.output_root,
+        output_dir=output_root,
         tracker=tracker,
         config=_config_from_args(args),
     )
-    print(json.dumps({"windows": len(windows), "output_root": str(args.output_root)}, indent=2))
+    print(
+        json.dumps(
+            {
+                "windows": len(windows),
+                "output_base": str(args.output_root),
+                "output_root": str(output_root),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
 def cmd_viewer(args: argparse.Namespace) -> int:
     records = read_frame_records(args.frames_root, args.source_type)
+    viewer_dir = _create_unique_run_dir(args.viewer_dir)
     payload = build_viewer(
         source_root=args.frames_root,
         frame_records=records,
         tracking_root=args.tracking_root,
-        viewer_dir=args.viewer_dir,
+        viewer_dir=viewer_dir,
         max_points_per_frame=args.max_points_per_frame,
         copy_frames=args.copy_frames,
         video_base_url=args.video_base_url,
@@ -92,7 +122,8 @@ def cmd_viewer(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "viewer": str(args.viewer_dir / "index.html"),
+                "viewer_base": str(args.viewer_dir),
+                "viewer": str(viewer_dir / "index.html"),
                 "frames": payload["metadata"]["frame_count"],
                 "windows": payload["metadata"]["successful_windows"],
             },
@@ -105,18 +136,23 @@ def cmd_viewer(args: argparse.Namespace) -> int:
 def cmd_all(args: argparse.Namespace) -> int:
     records = read_frame_records(args.frames_root, args.source_type)
     tracker = _tracker_from_args(args)
+    output_root = _create_unique_run_dir(args.output_root)
     run_inverse_tracking(
         source_root=args.frames_root,
         frame_records=records,
-        output_dir=args.output_root,
+        output_dir=output_root,
         tracker=tracker,
         config=_config_from_args(args),
     )
-    viewer_dir = args.viewer_dir or args.output_root / "viewer"
+    viewer_dir = (
+        _create_unique_run_dir(args.viewer_dir, preferred_name=output_root.name)
+        if args.viewer_dir
+        else output_root / "viewer"
+    )
     payload = build_viewer(
         source_root=args.frames_root,
         frame_records=records,
-        tracking_root=args.output_root,
+        tracking_root=output_root,
         viewer_dir=viewer_dir,
         max_points_per_frame=args.max_points_per_frame,
         copy_frames=args.copy_frames,
@@ -125,7 +161,9 @@ def cmd_all(args: argparse.Namespace) -> int:
     print(
         json.dumps(
             {
-                "output_root": str(args.output_root),
+                "output_base": str(args.output_root),
+                "output_root": str(output_root),
+                "viewer_base": str(args.viewer_dir) if args.viewer_dir else None,
                 "viewer": str(viewer_dir / "index.html"),
                 "frames": payload["metadata"]["frame_count"],
                 "windows": payload["metadata"]["successful_windows"],
@@ -146,7 +184,12 @@ def build_parser() -> argparse.ArgumentParser:
     track = sub.add_parser("track", help="Run inverse-video point tracking.")
     _add_source_args(track)
     _add_inverse_args(track)
-    track.add_argument("--output-root", type=Path, required=True)
+    track.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help=f"Base directory for unique run outputs. Default: {DEFAULT_OUTPUT_ROOT}",
+    )
     track.add_argument("--backend", choices=("lk", "cotracker"), default="lk")
     track.add_argument("--cotracker-device", default="auto")
     track.add_argument("--cotracker-batch-size", type=int, default=256)
@@ -158,7 +201,12 @@ def build_parser() -> argparse.ArgumentParser:
     viewer = sub.add_parser("viewer", help="Build the static WebUI from AVT artifacts.")
     _add_source_args(viewer)
     viewer.add_argument("--tracking-root", type=Path, required=True)
-    viewer.add_argument("--viewer-dir", type=Path, required=True)
+    viewer.add_argument(
+        "--viewer-dir",
+        type=Path,
+        default=DEFAULT_VIEWER_ROOT,
+        help=f"Base directory for unique viewer outputs. Default: {DEFAULT_VIEWER_ROOT}",
+    )
     viewer.add_argument("--max-points-per-frame", type=int, default=0)
     viewer.add_argument("--copy-frames", action="store_true")
     viewer.add_argument("--video-base-url", default="")
@@ -167,8 +215,18 @@ def build_parser() -> argparse.ArgumentParser:
     all_cmd = sub.add_parser("all", help="Run tracking and build the WebUI.")
     _add_source_args(all_cmd)
     _add_inverse_args(all_cmd)
-    all_cmd.add_argument("--output-root", type=Path, required=True)
-    all_cmd.add_argument("--viewer-dir", type=Path, default=None)
+    all_cmd.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_OUTPUT_ROOT,
+        help=f"Base directory for unique run outputs. Default: {DEFAULT_OUTPUT_ROOT}",
+    )
+    all_cmd.add_argument(
+        "--viewer-dir",
+        type=Path,
+        default=None,
+        help="Optional base directory for unique viewer outputs.",
+    )
     all_cmd.add_argument("--backend", choices=("lk", "cotracker"), default="lk")
     all_cmd.add_argument("--cotracker-device", default="auto")
     all_cmd.add_argument("--cotracker-batch-size", type=int, default=256)

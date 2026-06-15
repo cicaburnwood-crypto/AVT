@@ -5,6 +5,12 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from avt.cli import (
+    DEFAULT_OUTPUT_ROOT,
+    DEFAULT_VIEWER_ROOT,
+    _create_unique_run_dir,
+    build_parser,
+)
 from avt.inverse import InverseTrackConfig, build_queries, run_inverse_tracking
 from avt.io import read_frame_records
 from avt.schema import QueryPoint, TrackerInfo
@@ -39,6 +45,31 @@ def test_build_queries() -> None:
     queries = build_queries(width=100, height=80, frame_count=5, config=config)
     assert [q.reverse_time for q in queries] == [0, 0, 0, 2, 2, 2, 4, 4, 4]
     assert [q.id for q in queries] == list(range(9))
+
+
+def test_create_unique_run_dir(tmp_path: Path) -> None:
+    base = tmp_path / "outputs"
+    first = _create_unique_run_dir(base, preferred_name="run_test")
+    second = _create_unique_run_dir(base, preferred_name="run_test")
+
+    assert first == base / "run_test"
+    assert second == base / "run_test_01"
+    assert first.exists()
+    assert second.exists()
+
+
+def test_cli_output_defaults() -> None:
+    parser = build_parser()
+
+    track_args = parser.parse_args(["track", "--frames-root", "/tmp/frames"])
+    all_args = parser.parse_args(["all", "--frames-root", "/tmp/frames"])
+    viewer_args = parser.parse_args(
+        ["viewer", "--frames-root", "/tmp/frames", "--tracking-root", "/tmp/tracks"]
+    )
+
+    assert track_args.output_root == DEFAULT_OUTPUT_ROOT
+    assert all_args.output_root == DEFAULT_OUTPUT_ROOT
+    assert viewer_args.viewer_dir == DEFAULT_VIEWER_ROOT
 
 
 def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
