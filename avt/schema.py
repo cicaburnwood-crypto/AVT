@@ -30,6 +30,12 @@ class QueryPoint:
     x: float
     y: float
     side: int
+    source: str = "avt"
+    response: float | None = None
+    size: float | None = None
+    angle: float | None = None
+    octave: int | None = None
+    class_id: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         return asdict(self)

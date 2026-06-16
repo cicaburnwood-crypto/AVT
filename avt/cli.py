@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .inverse import InverseTrackConfig, run_inverse_tracking
 from .io import read_frame_records
+from .querying import QueryConfig, load_query_config_yaml, merge_query_config
 from .tracking import LKTracker
 from .viewer import build_viewer
 
@@ -45,14 +46,47 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--query-stride", type=int, default=10)
     parser.add_argument("--seed-count", type=int, default=17)
-    parser.add_argument("--seed-y-ratio", type=float, default=0.92)
-    parser.add_argument("--seed-x-min-ratio", type=float, default=0.40)
-    parser.add_argument("--seed-x-max-ratio", type=float, default=0.60)
+    parser.add_argument(
+        "--seed-y-ratio",
+        type=float,
+        default=None,
+        help="Override AVT seed-line y ratio. Defaults to the virtual robot footprint.",
+    )
+    parser.add_argument(
+        "--seed-x-min-ratio",
+        type=float,
+        default=None,
+        help="Override AVT seed-line left x ratio. Defaults to the virtual robot footprint.",
+    )
+    parser.add_argument(
+        "--seed-x-max-ratio",
+        type=float,
+        default=None,
+        help="Override AVT seed-line right x ratio. Defaults to the virtual robot footprint.",
+    )
+    parser.add_argument(
+        "--query-mode",
+        choices=("avt", "sift", "avt+sift"),
+        default=None,
+        help="Query source mode. Defaults to YAML query_mode or avt.",
+    )
+    parser.add_argument(
+        "--robot-config",
+        type=Path,
+        default=None,
+        help="YAML file with virtual_robot and sift query-capture settings.",
+    )
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument("--no-reverse-video", action="store_true")
 
 
 def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
+    query_config = (
+        load_query_config_yaml(args.robot_config)
+        if args.robot_config
+        else QueryConfig()
+    )
+    query_config = merge_query_config(query_config, mode=args.query_mode)
     return InverseTrackConfig(
         window_size=args.window_size,
         window_step=args.window_step,
@@ -62,6 +96,7 @@ def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
         seed_y_ratio=args.seed_y_ratio,
         seed_x_min_ratio=args.seed_x_min_ratio,
         seed_x_max_ratio=args.seed_x_max_ratio,
+        query_config=query_config,
         max_windows=args.max_windows,
         save_reverse_video=not args.no_reverse_video,
     )

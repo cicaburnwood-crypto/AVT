@@ -71,6 +71,7 @@ def _window_payload(
     tracks = arrays["tracks_reverse"]
     visibility = arrays["visibility_reverse"].astype(bool)
     queries = arrays["queries"]
+    query_records = _query_records(arrays)
 
     seq_start = int(meta["seq_start"])
     seq_end = int(meta["seq_end"])
@@ -81,10 +82,14 @@ def _window_payload(
         idx = int(row[0])
         reverse_time = max(0, min(t_len - 1, int(round(float(row[1])))))
         source_frame = max(0, min(frame_count - 1, seq_end - 1 - reverse_time))
+        record = query_records.get(idx, {})
         crumbs.append(
             {
                 "id": idx,
                 "side": int(row[4]),
+                "source": record.get("source", _query_source_from_row(row)),
+                "response": record.get("response"),
+                "size": record.get("size"),
                 "reverse_time": reverse_time,
                 "source_frame": source_frame,
                 "source_xy": _round_point(tracks[reverse_time, idx]),
@@ -118,6 +123,7 @@ def _window_payload(
         "seq_end": seq_end,
         "t_len": int(t_len),
         "query_count": int(query_count),
+        "query_capture": meta.get("query_capture", {}),
         "tracker": meta.get("tracker", {}),
         "mask": {
             "image": _copy_mask(window_dir, viewer_dir, meta["id"]),
@@ -128,6 +134,21 @@ def _window_payload(
         "crumbs": crumbs,
         "frames": frames_out,
     }
+
+
+def _query_records(arrays: np.lib.npyio.NpzFile) -> dict[int, dict[str, Any]]:
+    if "query_records_json" not in arrays:
+        return {}
+    raw = arrays["query_records_json"]
+    text = str(raw.item() if raw.shape == () else raw.tolist())
+    records = json.loads(text)
+    return {int(record["id"]): record for record in records}
+
+
+def _query_source_from_row(row: np.ndarray) -> str:
+    if len(row) < 6 or not np.isfinite(row[5]):
+        return "avt"
+    return {0: "avt", 1: "sift_robot"}.get(int(row[5]), "unknown")
 
 
 def build_payload(
@@ -624,7 +645,7 @@ sourceCanvas.addEventListener("click", (event) => {
   selectedText.textContent =
     `Window ${best.window.id}, point ${best.pointId}. ` +
     `Current frame ${frameIndex}, query source frame ${best.crumb.source_frame}, ` +
-    `side ${best.crumb.side < 0 ? "left" : "right"}.`;
+    `source ${best.crumb.source || "avt"}, side ${best.crumb.side < 0 ? "left" : "right"}.`;
   drawMain();
   drawSelectedSource();
 });

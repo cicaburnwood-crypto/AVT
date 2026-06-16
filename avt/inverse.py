@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from .io import load_frame_window, write_mp4
+from .querying import (
+    QueryConfig,
+    align_virtual_robot_to_image,
+    build_avt_queries,
+    build_sift_queries,
+    query_artifact_arrays,
+    query_capture_metadata,
+)
 from .schema import FrameRecord, QueryPoint, WindowSpec
 from .tracking.base import PointTracker, TrackingBundle
 
@@ -19,11 +27,25 @@ class InverseTrackConfig:
     fps: float = 10.0
     query_stride: int = 10
     seed_count: int = 17
-    seed_y_ratio: float = 0.92
-    seed_x_min_ratio: float = 0.40
-    seed_x_max_ratio: float = 0.60
+    seed_y_ratio: float | None = None
+    seed_x_min_ratio: float | None = None
+    seed_x_max_ratio: float | None = None
+    query_config: QueryConfig = field(default_factory=QueryConfig)
     max_windows: int | None = None
     save_reverse_video: bool = True
+
+
+def _avt_seed_ratios(config: InverseTrackConfig, width: int, height: int) -> tuple[float, float, float]:
+    alignment = align_virtual_robot_to_image(
+        height=height,
+        width=width,
+        robot=config.query_config.robot,
+    )
+    return (
+        alignment.seed_y_ratio if config.seed_y_ratio is None else config.seed_y_ratio,
+        alignment.seed_x_min_ratio if config.seed_x_min_ratio is None else config.seed_x_min_ratio,
+        alignment.seed_x_max_ratio if config.seed_x_max_ratio is None else config.seed_x_max_ratio,
+    )
 
 
 def build_windows(frame_count: int, config: InverseTrackConfig) -> list[WindowSpec]:
@@ -42,32 +64,66 @@ def build_windows(frame_count: int, config: InverseTrackConfig) -> list[WindowSp
     return windows
 
 
-def build_queries(width: int, height: int, frame_count: int, config: InverseTrackConfig) -> list[QueryPoint]:
-    if config.query_stride <= 0:
-        raise ValueError("query_stride must be positive")
-    if config.seed_count <= 0:
-        raise ValueError("seed_count must be positive")
-    xs = np.linspace(
-        config.seed_x_min_ratio * (width - 1),
-        config.seed_x_max_ratio * (width - 1),
-        config.seed_count,
-        dtype=np.float32,
-    )
-    y = float(config.seed_y_ratio * (height - 1))
+def build_queries(
+    width: int,
+    height: int,
+    frame_count: int,
+    config: InverseTrackConfig,
+    frames_rgb: np.ndarray | None = None,
+) -> list[QueryPoint]:
     queries: list[QueryPoint] = []
-    middle = (config.seed_count - 1) / 2.0
-    for reverse_time in range(0, frame_count, config.query_stride):
-        for i, x in enumerate(xs):
-            side = -1 if i <= middle else 1
-            queries.append(
-                QueryPoint(
-                    id=len(queries),
-                    reverse_time=int(reverse_time),
-                    x=float(x),
-                    y=y,
-                    side=side,
+    mode = config.query_config.mode
+    seed_y_ratio, seed_x_min_ratio, seed_x_max_ratio = _avt_seed_ratios(config, width, height)
+    want_sift = mode in {"sift", "avt+sift"} or config.query_config.sift.enabled
+
+    if want_sift:
+        if frames_rgb is None:
+            raise ValueError("frames_rgb is required for SIFT query capture")
+        queries.extend(
+            build_sift_queries(
+                frames_rgb=frames_rgb,
+                query_config=config.query_config,
+                start_id=len(queries),
+            )
+        )
+
+    if mode == "avt":
+        queries.extend(
+            build_avt_queries(
+                width=width,
+                height=height,
+                frame_count=frame_count,
+                query_stride=config.query_stride,
+                seed_count=config.seed_count,
+                seed_y_ratio=seed_y_ratio,
+                seed_x_min_ratio=seed_x_min_ratio,
+                seed_x_max_ratio=seed_x_max_ratio,
+                start_id=len(queries),
+            )
+        )
+    elif mode == "avt+sift":
+        shortage = config.query_config.sift.max_query_points - len(queries)
+        if shortage > 0:
+            queries.extend(
+                build_avt_queries(
+                    width=width,
+                    height=height,
+                    frame_count=frame_count,
+                    query_stride=config.query_stride,
+                    seed_count=config.seed_count,
+                    seed_y_ratio=seed_y_ratio,
+                    seed_x_min_ratio=seed_x_min_ratio,
+                    seed_x_max_ratio=seed_x_max_ratio,
+                    start_id=len(queries),
+                    max_points=shortage,
                 )
             )
+
+    if not queries and mode == "sift":
+        raise ValueError("No SIFT query points were generated")
+
+    if not queries:
+        raise ValueError("No query points were generated")
     return queries
 
 
@@ -103,15 +159,12 @@ def write_window_artifacts(
     window_dir.mkdir(parents=True, exist_ok=True)
     h, w = frames_rgb.shape[1:3]
 
-    query_array = np.array(
-        [[q.id, q.reverse_time, q.x, q.y, q.side] for q in queries],
-        dtype=np.float32,
-    )
+    query_arrays = query_artifact_arrays(queries)
     np.savez_compressed(
         window_dir / "tracks.npz",
         tracks_reverse=bundle.tracks.astype(np.float32),
         visibility_reverse=bundle.visibility.astype(bool),
-        queries=query_array,
+        **query_arrays,
     )
 
     mask_rgba = reference_mask(bundle, h, w)
@@ -120,6 +173,7 @@ def write_window_artifacts(
     if config.save_reverse_video:
         write_mp4(window_dir / "reverse_video.mp4", frames_rgb[::-1].copy(), config.fps)
 
+    seed_y_ratio, seed_x_min_ratio, seed_x_max_ratio = _avt_seed_ratios(config, w, h)
     metadata = {
         "id": window.id,
         "seq_start": window.start,
@@ -129,6 +183,12 @@ def write_window_artifacts(
         "height": int(h),
         "fps": float(config.fps),
         "query_count": len(queries),
+        "query_capture": query_capture_metadata(config.query_config, width=w, height=h),
+        "resolved_avt_seed": {
+            "y_ratio": seed_y_ratio,
+            "x_min_ratio": seed_x_min_ratio,
+            "x_max_ratio": seed_x_max_ratio,
+        },
         "tracker": bundle.tracker.to_json(),
         "config": asdict(config),
         "files": {
@@ -167,7 +227,7 @@ def run_inverse_tracking(
         frames = load_frame_window(source_root, frame_records, window.start, window.end)
         frames_reverse = frames[::-1].copy()
         h, w = frames.shape[1:3]
-        queries = build_queries(w, h, len(frames), config)
+        queries = build_queries(w, h, len(frames), config, frames_rgb=frames_reverse)
         bundle = tracker.track(frames_reverse, queries)
         bundle.validate(len(frames), len(queries))
         write_window_artifacts(output_dir, window, frames, queries, bundle, config)

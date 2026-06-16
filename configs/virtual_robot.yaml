@@ -1,0 +1,23 @@
+query_mode: avt+sift
+
+virtual_robot:
+  # Approximate robot dimensions are enough. AVT does not require camera intrinsics.
+  width_cm: 40
+  length_cm: 60
+  # Optional weak prior only; set to null if the source video camera height is unknown.
+  camera_height_cm: 18
+  # Leave footprint ratios unset to derive them from the virtual robot geometry.
+  # footprint_width_ratio: 0.25
+  # footprint_length_ratio: 0.20
+
+sift:
+  enabled: true
+  # In avt+sift mode this is the total target: SIFT first, AVT fills any shortage.
+  max_query_points: 384
+  temporal_stride: 3
+  sample_at_edges: true
+  edge_offset_ratio: 0.15
+  n_octave_layers: 7
+  contrast_threshold: 0.02
+  edge_threshold: 18.0
+  sigma: 1.6
