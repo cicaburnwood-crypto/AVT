@@ -80,14 +80,17 @@ def _window_payload(
     crumbs: list[dict[str, Any]] = []
     for row in queries:
         idx = int(row[0])
+        record = query_records.get(idx, {})
+        source = record.get("source", _query_source_from_row(row))
+        if source == "sift_anchor":
+            continue
         reverse_time = max(0, min(t_len - 1, int(round(float(row[1])))))
         source_frame = max(0, min(frame_count - 1, seq_end - 1 - reverse_time))
-        record = query_records.get(idx, {})
         crumbs.append(
             {
                 "id": idx,
                 "side": int(row[4]),
-                "source": record.get("source", _query_source_from_row(row)),
+                "source": source,
                 "response": record.get("response"),
                 "size": record.get("size"),
                 "reverse_time": reverse_time,
@@ -102,6 +105,15 @@ def _window_payload(
         if reverse_t < 0 or reverse_t >= t_len:
             continue
         ids = np.flatnonzero(visibility[reverse_t])
+        ids = np.array(
+            [
+                idx
+                for idx in ids
+                if query_records.get(int(idx), {}).get("source", _query_source_from_row(queries[int(idx)]))
+                != "sift_anchor"
+            ],
+            dtype=np.int64,
+        )
         if max_points_per_frame > 0 and ids.size > max_points_per_frame:
             ids = ids[:max_points_per_frame]
         points = [
@@ -148,7 +160,7 @@ def _query_records(arrays: np.lib.npyio.NpzFile) -> dict[int, dict[str, Any]]:
 def _query_source_from_row(row: np.ndarray) -> str:
     if len(row) < 6 or not np.isfinite(row[5]):
         return "avt"
-    return {0: "avt", 1: "sift_robot"}.get(int(row[5]), "unknown")
+    return {0: "avt", 1: "sift_robot", 2: "sift_anchor"}.get(int(row[5]), "unknown")
 
 
 def build_payload(
@@ -277,7 +289,7 @@ HTML = """<!doctype html>
       </section>
     </aside>
   </main>
-  <script src="app.js"></script>
+  <script src="app.js?v=2"></script>
 </body>
 </html>
 """
@@ -422,6 +434,8 @@ let timer = null;
 let drawPoints = [];
 const imageCache = new Map();
 const maskCache = new Map();
+let pendingMainFrame = null;
+let pendingSelectedFrame = null;
 
 function frameImage(index) {
   const frame = data.frames[index];
@@ -432,6 +446,15 @@ function frameImage(index) {
     imageCache.set(frame.image, img);
   }
   return imageCache.get(frame.image);
+}
+
+function preloadFrames(center, radius = 8) {
+  if (!data) return;
+  const start = Math.max(0, center - 2);
+  const end = Math.min(data.frames.length - 1, center + radius);
+  for (let index = start; index <= end; index += 1) {
+    frameImage(index);
+  }
 }
 
 function maskImage(win) {
@@ -479,8 +502,12 @@ function activeWindow() {
 function resizeCanvas(canvas, ctx) {
   const rect = canvas.getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
-  canvas.width = Math.max(1, Math.round(rect.width * dpr));
-  canvas.height = Math.max(1, Math.round(rect.height * dpr));
+  const nextWidth = Math.max(1, Math.round(rect.width * dpr));
+  const nextHeight = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+    canvas.width = nextWidth;
+    canvas.height = nextHeight;
+  }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
@@ -506,7 +533,7 @@ function drawMask(win, fit) {
   const img = maskImage(win);
   if (!img) return;
   if (!img.complete) {
-    img.onload = drawMain;
+    img.onload = () => window.requestAnimationFrame(drawMain);
     return;
   }
   sourceCtx.drawImage(img, fit.x, fit.y, fit.w, fit.h);
@@ -514,12 +541,16 @@ function drawMask(win, fit) {
 
 function drawMain() {
   if (!data) return;
-  resizeCanvas(sourceCanvas, sourceCtx);
   const img = frameImage(frameIndex);
+  if (!img) return;
   if (!img.complete) {
-    img.onload = drawMain;
+    pendingMainFrame = frameIndex;
+    img.onload = () => {
+      if (pendingMainFrame === frameIndex) window.requestAnimationFrame(drawMain);
+    };
     return;
   }
+  resizeCanvas(sourceCanvas, sourceCtx);
   const fit = drawImageFit(sourceCtx, sourceCanvas, img);
   const win = activeWindow();
   const tracks = win ? frameTracks(win, frameIndex) : null;
@@ -545,16 +576,22 @@ function drawMain() {
 }
 
 function drawSelectedSource() {
-  resizeCanvas(pointCanvas, pointCtx);
   if (!selectedPoint) {
+    resizeCanvas(pointCanvas, pointCtx);
     pointCtx.clearRect(0, 0, pointCanvas.width, pointCanvas.height);
     return;
   }
   const img = frameImage(selectedPoint.crumb.source_frame);
   if (!img.complete) {
-    img.onload = drawSelectedSource;
+    pendingSelectedFrame = selectedPoint.crumb.source_frame;
+    img.onload = () => {
+      if (selectedPoint && pendingSelectedFrame === selectedPoint.crumb.source_frame) {
+        window.requestAnimationFrame(drawSelectedSource);
+      }
+    };
     return;
   }
+  resizeCanvas(pointCanvas, pointCtx);
   const fit = drawImageFit(pointCtx, pointCanvas, img);
   if (!fit) return;
   const [x, y] = imageToCanvas(selectedPoint.crumb.source_xy, fit);
@@ -601,6 +638,7 @@ function updateText(win, tracks) {
 
 function setFrame(index) {
   frameIndex = Math.max(0, Math.min(data.frames.length - 1, Number(index) || 0));
+  preloadFrames(frameIndex);
   drawMain();
 }
 
@@ -611,6 +649,7 @@ function tick() {
     return;
   }
   frameIndex += 1;
+  preloadFrames(frameIndex);
   drawMain();
   timer = window.setTimeout(tick, 1000 / (10 * Number(speedSelect.value)));
 }

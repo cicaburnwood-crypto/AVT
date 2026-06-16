@@ -50,31 +50,31 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
         "--seed-y-ratio",
         type=float,
         default=None,
-        help="Override AVT seed-line y ratio. Defaults to the virtual robot footprint.",
+        help="Override AVT seed-line y ratio for manual avt mode.",
     )
     parser.add_argument(
         "--seed-x-min-ratio",
         type=float,
         default=None,
-        help="Override AVT seed-line left x ratio. Defaults to the virtual robot footprint.",
+        help="Override AVT seed-line left x ratio for manual avt mode.",
     )
     parser.add_argument(
         "--seed-x-max-ratio",
         type=float,
         default=None,
-        help="Override AVT seed-line right x ratio. Defaults to the virtual robot footprint.",
+        help="Override AVT seed-line right x ratio for manual avt mode.",
     )
     parser.add_argument(
         "--query-mode",
-        choices=("avt", "sift", "avt+sift"),
+        choices=("ventura", "avt", "sift", "avt+sift"),
         default=None,
-        help="Query source mode. Defaults to YAML query_mode or avt.",
+        help="Query source mode. Defaults to YAML query_mode or ventura.",
     )
     parser.add_argument(
         "--robot-config",
         type=Path,
         default=None,
-        help="YAML file with virtual_robot and sift query-capture settings.",
+        help="YAML file with VENTURA footprint and SIFT query-capture settings.",
     )
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument("--no-reverse-video", action="store_true")

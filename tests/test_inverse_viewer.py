@@ -15,11 +15,13 @@ from avt.inverse import InverseTrackConfig, build_queries, run_inverse_tracking
 from avt.io import read_frame_records
 from avt.querying import (
     QueryConfig,
+    SiftAnchorConfig,
     SiftCaptureConfig,
     VirtualRobotConfig,
     align_virtual_robot_to_image,
     query_artifact_arrays,
     query_config_from_mapping,
+    robot_sift_mask,
 )
 from avt.schema import QueryPoint, TrackerInfo
 from avt.tracking.base import TrackingBundle
@@ -49,85 +51,75 @@ def write_frames(root: Path, count: int = 6) -> None:
 
 
 def test_build_queries() -> None:
-    config = InverseTrackConfig(query_stride=2, seed_count=3)
+    config = InverseTrackConfig(
+        query_stride=2,
+        seed_count=3,
+        query_config=QueryConfig(mode="avt", sift=SiftCaptureConfig(enabled=False)),
+    )
     queries = build_queries(width=100, height=80, frame_count=5, config=config)
     assert [q.reverse_time for q in queries] == [0, 0, 0, 2, 2, 2, 4, 4, 4]
     assert [q.id for q in queries] == list(range(9))
 
 
-def test_build_sift_first_avt_fallback_queries() -> None:
-    frames = np.zeros((6, 96, 128, 3), dtype=np.uint8)
-    for t in range(len(frames)):
-        cv2.rectangle(frames[t], (42, 78), (46, 82), (255, 255, 255), -1)
+def test_build_ventura_anchor_and_crumb_queries() -> None:
+    rng = np.random.default_rng(7)
+    frames = rng.integers(0, 255, size=(8, 96, 128, 3), dtype=np.uint8)
 
     config = InverseTrackConfig(
-        window_size=6,
-        query_stride=1,
-        seed_count=17,
         query_config=QueryConfig(
-            mode="avt+sift",
-            robot=VirtualRobotConfig(
-                width_m=0.40,
-                length_m=0.60,
-                camera_height_m=0.18,
-                footprint_width_ratio=0.45,
-                footprint_length_ratio=0.30,
-            ),
+            mode="ventura",
+            robot=VirtualRobotConfig(width_ratio=0.60, height_ratio=0.35),
             sift=SiftCaptureConfig(
                 enabled=True,
-                max_query_points=80,
-                temporal_stride=2,
-                edge_offset_ratio=0.35,
+                max_query_points=16,
+                window_size=4,
+                edge_offset_ratio=0.25,
+                contrast_threshold=0.001,
+                anchors=SiftAnchorConfig(
+                    enabled=True,
+                    max_query_points=16,
+                    window_size=4,
+                    contrast_threshold=0.001,
+                ),
             ),
         ),
     )
 
     queries = build_queries(128, 96, len(frames), config, frames_rgb=frames)
-    sources = {query.source for query in queries}
     arrays = query_artifact_arrays(queries)
 
-    assert len(queries) == 80
-    assert {"avt", "sift_robot"}.issubset(sources)
+    assert {query.source for query in queries} == {"sift_anchor", "sift_robot"}
+    assert "avt" not in {query.source for query in queries}
     assert [query.id for query in queries] == list(range(len(queries)))
-    first_avt = next(idx for idx, query in enumerate(queries) if query.source == "avt")
-    assert all(query.source == "sift_robot" for query in queries[:first_avt])
-    assert all(query.source == "avt" for query in queries[first_avt:])
+    first_robot = next(idx for idx, query in enumerate(queries) if query.source == "sift_robot")
+    assert all(query.source == "sift_anchor" for query in queries[:first_robot])
+    assert all(query.source == "sift_robot" for query in queries[first_robot:])
     assert arrays["queries"].shape[1] == 11
     assert arrays["queries_cotracker"].shape == (len(queries), 3)
+    assert set(arrays["query_source_codes"].tolist()) == {1, 2}
 
 
-def test_robot_aligned_avt_fallback_ratios() -> None:
-    frames = np.zeros((4, 96, 128, 3), dtype=np.uint8)
-    config = InverseTrackConfig(
-        query_stride=2,
-        seed_count=3,
-        query_config=QueryConfig(
-            mode="avt+sift",
-            robot=VirtualRobotConfig(
-                footprint_width_ratio=0.50,
-                footprint_length_ratio=0.20,
-            ),
-            sift=SiftCaptureConfig(enabled=True, max_query_points=5, temporal_stride=2),
-        ),
+def test_ventura_pct_mask_edges() -> None:
+    mask = robot_sift_mask(
+        100,
+        200,
+        VirtualRobotConfig(width_ratio=0.20, height_ratio=0.20),
+        SiftCaptureConfig(edge_offset_ratio=0.25),
     )
 
-    queries = build_queries(128, 96, len(frames), config, frames_rgb=frames)
-
-    assert len(queries) == 5
-    assert {query.source for query in queries} == {"avt"}
-    assert queries[0].x == np.float32(0.25 * (128 - 1))
-    assert queries[1].x == np.float32(0.50 * (128 - 1))
-    assert queries[2].x == np.float32(0.75 * (128 - 1))
-    assert queries[0].y == 0.90 * (96 - 1)
+    assert mask[90, 85] == 255
+    assert mask[90, 100] == 0
+    assert mask[90, 115] == 255
+    assert mask[79, 85] == 0
 
 
 def test_virtual_robot_alignment_auto_detects_resolution() -> None:
-    robot = VirtualRobotConfig(width_m=0.40, length_m=0.60, camera_height_m=None)
+    robot = VirtualRobotConfig(width_ratio=0.20, height_ratio=0.15)
 
     low_res = align_virtual_robot_to_image(height=720, width=1280, robot=robot)
     wide_res = align_virtual_robot_to_image(height=1080, width=1920, robot=robot)
 
-    assert low_res.method == "image_normalized_no_intrinsics"
+    assert low_res.method == "ventura_pct_bottom_center"
     assert low_res.frame_width == 1280
     assert low_res.frame_height == 720
     assert 0 <= low_res.left < low_res.right <= 1280
@@ -135,31 +127,37 @@ def test_virtual_robot_alignment_auto_detects_resolution() -> None:
     assert wide_res.frame_width == 1920
     assert wide_res.frame_height == 1080
     assert low_res.seed_x_min_ratio < 0.5 < low_res.seed_x_max_ratio
-    assert low_res.seed_y_ratio > 0.5
+    assert low_res.width_ratio == 0.20
+    assert low_res.length_ratio == 0.15
+    assert low_res.seed_y_ratio == 0.925
 
 
 def test_query_config_from_yaml_mapping() -> None:
     config = query_config_from_mapping(
         {
-            "query_mode": "avt+sift",
-            "virtual_robot": {
-                "width_cm": 40,
-                "length_cm": 60,
-                "camera_height_cm": 18,
+            "query_mode": "ventura",
+            "footprint": {
+                "width_ratio": 0.25,
+                "height_ratio": 0.20,
             },
             "sift": {
                 "enabled": True,
                 "max_query_points": 384,
-                "temporal_stride": 3,
+                "window_size": 20,
+                "anchors": {
+                    "enabled": True,
+                    "max_query_points": 192,
+                },
             },
         }
     )
 
-    assert config.mode == "avt+sift"
-    assert config.robot.width_m == 0.40
-    assert config.robot.length_m == 0.60
-    assert config.robot.camera_height_m == 0.18
+    assert config.mode == "ventura"
+    assert config.robot.width_ratio == 0.25
+    assert config.robot.height_ratio == 0.20
     assert config.sift.max_query_points == 384
+    assert config.sift.window_size == 20
+    assert config.sift.anchors.max_query_points == 192
 
 
 def test_create_unique_run_dir(tmp_path: Path) -> None:
@@ -199,6 +197,7 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
         seed_count=3,
         max_windows=1,
         save_reverse_video=False,
+        query_config=QueryConfig(mode="avt", sift=SiftCaptureConfig(enabled=False)),
     )
     windows = run_inverse_tracking(frames_root, records, output_root, FakeTracker(), config)
     assert len(windows) == 1

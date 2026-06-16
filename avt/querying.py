@@ -14,6 +14,7 @@ from .schema import QueryPoint
 QUERY_SOURCE_CODES = {
     "avt": 0,
     "sift_robot": 1,
+    "sift_anchor": 2,
 }
 
 QUERY_NUMERIC_COLUMNS = [
@@ -33,31 +34,13 @@ QUERY_NUMERIC_COLUMNS = [
 
 @dataclass
 class VirtualRobotConfig:
-    """Approximate virtual robot footprint used to place AVT/SIFT query regions."""
+    """VENTURA-style bottom-center robot footprint in normalized image units."""
 
-    width_m: float = 0.40
-    length_m: float = 0.60
-    camera_height_m: float | None = 0.18
-    footprint_width_ratio: float | None = None
-    footprint_length_ratio: float | None = None
-
-    def effective_camera_height_m(self) -> float:
-        if self.camera_height_m is None:
-            return 0.18
-        return _positive(self.camera_height_m, "virtual robot camera_height_m")
+    width_ratio: float = 0.20
+    height_ratio: float = 0.15
 
     def derived_footprint_ratios(self) -> tuple[float, float]:
-        width = _positive(self.width_m, "virtual robot width_m")
-        length = _positive(self.length_m, "virtual robot length_m")
-        camera_height = self.effective_camera_height_m()
-        span = length + camera_height
-        width_ratio = self.footprint_width_ratio
-        length_ratio = self.footprint_length_ratio
-        if width_ratio is None:
-            width_ratio = width / (2.0 * span)
-        if length_ratio is None:
-            length_ratio = length / (4.0 * span)
-        return _clamp(width_ratio, 0.03, 0.80), _clamp(length_ratio, 0.03, 0.60)
+        return _clamp(self.width_ratio, 0.03, 0.80), _clamp(self.height_ratio, 0.03, 0.60)
 
     def avt_seed_x_ratios(self) -> tuple[float, float]:
         width_ratio, _ = self.derived_footprint_ratios()
@@ -94,25 +77,48 @@ class RobotImageAlignment:
 
 
 @dataclass
-class SiftCaptureConfig:
-    """VENTURA-style SIFT query capture controls."""
+class SiftAnchorConfig:
+    """VENTURA full-frame SIFT anchors used to stabilize tracking."""
 
-    enabled: bool = False
+    enabled: bool = True
     max_query_points: int = 384
-    temporal_stride: int = 3
+    window_size: int | None = None
+    n_octave_layers: int = 3
+    contrast_threshold: float = 0.008
+    edge_threshold: float = 15.0
+    sigma: float = 1.2
+
+
+@dataclass
+class SiftCaptureConfig:
+    """VENTURA SIFT query capture controls."""
+
+    enabled: bool = True
+    max_query_points: int = 384
+    window_size: int = 20
     sample_at_edges: bool = True
-    edge_offset_ratio: float = 0.15
+    edge_offset_ratio: float = 0.10
     n_octave_layers: int = 7
     contrast_threshold: float = 0.02
     edge_threshold: float = 18.0
     sigma: float = 1.6
+    use_clahe: bool = True
+    clahe_clip_limit: float = 2.0
+    clahe_tile_grid_size: int = 8
+    anchors: SiftAnchorConfig = field(default_factory=SiftAnchorConfig)
+
+    @property
+    def temporal_stride(self) -> int:
+        """Compatibility alias for older AVT configs; VENTURA calls this window_size."""
+
+        return self.window_size
 
 
 @dataclass
 class QueryConfig:
     """Top-level query source configuration."""
 
-    mode: str = "avt"
+    mode: str = "ventura"
     robot: VirtualRobotConfig = field(default_factory=VirtualRobotConfig)
     sift: SiftCaptureConfig = field(default_factory=SiftCaptureConfig)
 
@@ -131,37 +137,68 @@ def load_query_config_yaml(path: Path) -> QueryConfig:
 
 
 def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
-    mode = str(data.get("query_mode", data.get("mode", "avt")))
-    robot_data = data.get("virtual_robot", data.get("robot", {})) or {}
+    mode = str(data.get("query_mode", data.get("mode", "ventura")))
+    robot_data = (
+        data.get("footprint")
+        or data.get("ventura_footprint")
+        or data.get("virtual_robot")
+        or data.get("robot")
+        or {}
+    )
     sift_data = data.get("sift", data.get("sift_capture", {})) or {}
     if not isinstance(robot_data, dict):
-        raise ValueError("virtual_robot must be a mapping")
+        raise ValueError("footprint must be a mapping")
     if not isinstance(sift_data, dict):
         raise ValueError("sift must be a mapping")
+    anchor_data = sift_data.get("anchors", sift_data.get("anchor", {})) or {}
+    if not isinstance(anchor_data, dict):
+        raise ValueError("sift.anchors must be a mapping")
 
     robot = VirtualRobotConfig(
-        width_m=_meters(robot_data, "width", 0.40),
-        length_m=_meters(robot_data, "length", 0.60),
-        camera_height_m=_optional_meters(robot_data, "camera_height", 0.18),
-        footprint_width_ratio=_optional_float(robot_data, "footprint_width_ratio"),
-        footprint_length_ratio=_optional_float(robot_data, "footprint_length_ratio"),
+        width_ratio=_ratio_value(
+            robot_data,
+            ("width_ratio", "robot_width_pct", "footprint_width_ratio"),
+            0.20,
+        ),
+        height_ratio=_ratio_value(
+            robot_data,
+            ("height_ratio", "robot_height_pct", "footprint_height_ratio", "footprint_length_ratio"),
+            0.15,
+        ),
+    )
+    anchors = SiftAnchorConfig(
+        enabled=_as_bool(anchor_data.get("enabled", True)),
+        max_query_points=int(anchor_data.get("max_query_points", 384)),
+        window_size=(
+            int(anchor_data["window_size"])
+            if anchor_data.get("window_size") is not None
+            else None
+        ),
+        n_octave_layers=int(anchor_data.get("n_octave_layers", 3)),
+        contrast_threshold=float(anchor_data.get("contrast_threshold", 0.008)),
+        edge_threshold=float(anchor_data.get("edge_threshold", 15.0)),
+        sigma=float(anchor_data.get("sigma", 1.2)),
     )
     sift = SiftCaptureConfig(
-        enabled=_as_bool(sift_data.get("enabled", mode in {"sift", "avt+sift"})),
+        enabled=_as_bool(sift_data.get("enabled", mode in {"ventura", "sift", "avt+sift"})),
         max_query_points=int(sift_data.get("max_query_points", 384)),
-        temporal_stride=int(sift_data.get("temporal_stride", sift_data.get("window_size", 3))),
+        window_size=int(sift_data.get("window_size", sift_data.get("temporal_stride", 20))),
         sample_at_edges=_as_bool(sift_data.get("sample_at_edges", True)),
-        edge_offset_ratio=float(sift_data.get("edge_offset_ratio", 0.15)),
+        edge_offset_ratio=float(sift_data.get("edge_offset_ratio", 0.10)),
         n_octave_layers=int(sift_data.get("n_octave_layers", 7)),
         contrast_threshold=float(sift_data.get("contrast_threshold", 0.02)),
         edge_threshold=float(sift_data.get("edge_threshold", 18.0)),
         sigma=float(sift_data.get("sigma", 1.6)),
+        use_clahe=_as_bool(sift_data.get("use_clahe", True)),
+        clahe_clip_limit=float(sift_data.get("clahe_clip_limit", 2.0)),
+        clahe_tile_grid_size=int(sift_data.get("clahe_tile_grid_size", 8)),
+        anchors=anchors,
     )
     mode = _validate_mode(mode)
-    if mode in {"sift", "avt+sift"} and not sift.enabled:
+    if mode in {"ventura", "sift", "avt+sift"} and not sift.enabled:
         sift = replace(sift, enabled=True)
     if sift.enabled and mode == "avt":
-        mode = "avt+sift"
+        mode = "ventura"
     return QueryConfig(mode=mode, robot=robot, sift=sift)
 
 
@@ -173,12 +210,12 @@ def merge_query_config(
 ) -> QueryConfig:
     next_mode = _validate_mode(mode) if mode else base.mode
     next_sift = base.sift
-    if mode in {"sift", "avt+sift"} and not next_sift.enabled:
+    if mode in {"ventura", "sift", "avt+sift"} and not next_sift.enabled:
         next_sift = replace(next_sift, enabled=True)
     if enable_sift is not None:
         next_sift = replace(next_sift, enabled=enable_sift)
         if enable_sift and next_mode == "avt":
-            next_mode = "avt+sift"
+            next_mode = "ventura"
     return replace(base, mode=next_mode, sift=next_sift)
 
 
@@ -238,53 +275,166 @@ def build_sift_queries(
         raise ValueError("frames_rgb must have shape [T,H,W,3]")
     if query_config.sift.max_query_points <= 0:
         raise ValueError("sift max_query_points must be positive")
-    if query_config.sift.temporal_stride <= 0:
-        raise ValueError("sift temporal_stride must be positive")
+    if query_config.sift.window_size <= 0:
+        raise ValueError("sift window_size must be positive")
 
     frame_count, height, width = frames_rgb.shape[:3]
     mask = robot_sift_mask(height, width, query_config.robot, query_config.sift)
-    sift = cv2.SIFT_create(
-        nOctaveLayers=query_config.sift.n_octave_layers,
-        contrastThreshold=query_config.sift.contrast_threshold,
-        edgeThreshold=query_config.sift.edge_threshold,
-        sigma=query_config.sift.sigma,
+    times = _sift_times(frame_count, query_config.sift.window_size)
+    return _sample_sift_queries(
+        frames_rgb=frames_rgb,
+        times=times,
+        max_query_points=query_config.sift.max_query_points,
+        mask=mask,
+        sift_config=query_config.sift,
+        params=query_config.sift,
+        source="sift_robot",
+        start_id=start_id,
+        balance_full_mask=False,
     )
-    times = _sift_times(frame_count, query_config.sift.temporal_stride)
-    samples_per_time = max(1, int(np.ceil(query_config.sift.max_query_points / len(times))))
 
-    captured: list[tuple[float, QueryPoint]] = []
+
+def build_ventura_queries(
+    frames_rgb: np.ndarray,
+    query_config: QueryConfig,
+    *,
+    start_id: int = 0,
+) -> list[QueryPoint]:
+    """Build VENTURA-equivalent anchor + robot-footprint SIFT queries."""
+
+    if frames_rgb.ndim != 4 or frames_rgb.shape[-1] != 3:
+        raise ValueError("frames_rgb must have shape [T,H,W,3]")
+    if not query_config.sift.enabled:
+        return []
+    if query_config.sift.window_size <= 0:
+        raise ValueError("sift window_size must be positive")
+
+    frame_count, height, width = frames_rgb.shape[:3]
+    queries: list[QueryPoint] = []
+    anchors = query_config.sift.anchors
+    if anchors.enabled:
+        anchor_window = anchors.window_size or query_config.sift.window_size
+        if anchor_window <= 0:
+            raise ValueError("sift anchor window_size must be positive")
+        queries.extend(
+            _sample_sift_queries(
+                frames_rgb=frames_rgb,
+                times=_sift_times(frame_count, anchor_window),
+                max_query_points=anchors.max_query_points,
+                mask=None,
+                sift_config=query_config.sift,
+                params=anchors,
+                source="sift_anchor",
+                start_id=start_id + len(queries),
+                balance_full_mask=True,
+            )
+        )
+    queries.extend(
+        _sample_sift_queries(
+            frames_rgb=frames_rgb,
+            times=_sift_times(frame_count, query_config.sift.window_size),
+            max_query_points=query_config.sift.max_query_points,
+            mask=robot_sift_mask(height, width, query_config.robot, query_config.sift),
+            sift_config=query_config.sift,
+            params=query_config.sift,
+            source="sift_robot",
+            start_id=start_id + len(queries),
+            balance_full_mask=False,
+        )
+    )
+    return queries
+
+
+def _sample_sift_queries(
+    *,
+    frames_rgb: np.ndarray,
+    times: list[int],
+    max_query_points: int,
+    mask: np.ndarray | None,
+    sift_config: SiftCaptureConfig,
+    params: SiftCaptureConfig | SiftAnchorConfig,
+    source: str,
+    start_id: int,
+    balance_full_mask: bool,
+) -> list[QueryPoint]:
+    if max_query_points <= 0:
+        return []
+    if not times:
+        return []
+    _, height, width = frames_rgb.shape[:3]
+    sift_detector = cv2.SIFT_create(
+        nfeatures=0,
+        nOctaveLayers=params.n_octave_layers,
+        contrastThreshold=params.contrast_threshold,
+        edgeThreshold=params.edge_threshold,
+        sigma=params.sigma,
+    )
+    samples_per_time = max(1, int(max_query_points / len(times)))
+    queries: list[QueryPoint] = []
     for reverse_time in times:
         gray = cv2.cvtColor(frames_rgb[reverse_time], cv2.COLOR_RGB2GRAY)
-        keypoints = sorted(sift.detect(gray, mask), key=lambda kp: kp.response, reverse=True)
-        for keypoint in keypoints[:samples_per_time]:
+        gray = _local_equalize(gray, sift_config=sift_config)
+        keypoints, _ = sift_detector.detectAndCompute(gray, mask)
+        if not keypoints:
+            continue
+        picked = _pick_sift_keypoints(
+            keypoints,
+            width=width,
+            count=samples_per_time,
+            balance_halves=balance_full_mask,
+        )
+        for keypoint in picked:
             x, y = keypoint.pt
             side = -1 if x < width / 2.0 else 1
-            captured.append(
-                (
-                    float(keypoint.response),
-                    QueryPoint(
-                        id=-1,
-                        reverse_time=int(reverse_time),
-                        x=float(x),
-                        y=float(y),
-                        side=side,
-                        source="sift_robot",
-                        response=float(keypoint.response),
-                        size=float(keypoint.size),
-                        angle=float(keypoint.angle),
-                        octave=int(keypoint.octave),
-                        class_id=int(keypoint.class_id),
-                    ),
+            queries.append(
+                QueryPoint(
+                    id=start_id + len(queries),
+                    reverse_time=int(reverse_time),
+                    x=float(x),
+                    y=float(y),
+                    side=side,
+                    source=source,
+                    response=float(keypoint.response),
+                    size=float(keypoint.size),
+                    angle=float(keypoint.angle),
+                    octave=int(keypoint.octave),
+                    class_id=int(keypoint.class_id),
                 )
             )
+    return queries
 
-    captured.sort(key=lambda item: item[0], reverse=True)
-    captured = captured[: query_config.sift.max_query_points]
-    captured.sort(key=lambda item: (item[1].reverse_time, item[1].y, item[1].x))
-    return [
-        replace(query, id=start_id + idx)
-        for idx, (_, query) in enumerate(captured)
-    ]
+
+def _pick_sift_keypoints(
+    keypoints: tuple[cv2.KeyPoint, ...] | list[cv2.KeyPoint],
+    *,
+    width: int,
+    count: int,
+    balance_halves: bool,
+) -> list[cv2.KeyPoint]:
+    ordered = sorted(keypoints, key=lambda kp: kp.response, reverse=True)
+    if not balance_halves:
+        return ordered[:count]
+
+    left = [kp for kp in ordered if kp.pt[0] < width / 2.0]
+    right = [kp for kp in ordered if kp.pt[0] >= width / 2.0]
+    n_left = count // 2
+    n_right = count - n_left
+    picked = left[:n_left] + right[:n_right]
+    if len(picked) < count:
+        picked_ids = {id(kp) for kp in picked}
+        picked.extend([kp for kp in ordered if id(kp) not in picked_ids][: count - len(picked)])
+    return picked
+
+
+def _local_equalize(gray: np.ndarray, *, sift_config: SiftCaptureConfig) -> np.ndarray:
+    if not sift_config.use_clahe:
+        return gray
+    tile = max(1, int(sift_config.clahe_tile_grid_size))
+    clahe = cv2.createCLAHE(
+        clipLimit=float(sift_config.clahe_clip_limit),
+        tileGridSize=(tile, tile),
+    )
+    return clahe.apply(gray)
 
 
 def robot_sift_mask(
@@ -302,7 +452,7 @@ def robot_sift_mask(
 
     if sift.sample_at_edges:
         rect_width = max(1, right - left)
-        edge_width = max(1, int(round(rect_width * sift.edge_offset_ratio)))
+        edge_width = int(rect_width * sift.edge_offset_ratio)
         inner_left = min(right, left + edge_width)
         inner_right = max(left, right - edge_width)
         if inner_right > inner_left:
@@ -316,43 +466,29 @@ def align_virtual_robot_to_image(
     width: int,
     robot: VirtualRobotConfig,
 ) -> RobotImageAlignment:
-    """Align an approximate robot footprint to an image without camera intrinsics.
-
-    This deliberately uses normalized image geometry. It is meant for internet
-    videos where focal length, pitch, and camera height are usually unknown.
-    """
+    """Align VENTURA's normalized bottom robot footprint to an image."""
 
     if width <= 0 or height <= 0:
         raise ValueError("frame width and height must be positive")
 
-    width_ratio, length_ratio = robot.derived_footprint_ratios()
-    frame_aspect = width / float(height)
-    reference_aspect = 16.0 / 9.0
-
-    if robot.footprint_width_ratio is None:
-        aspect_scale = _clamp((frame_aspect / reference_aspect) ** 0.25, 0.85, 1.15)
-        width_ratio = _clamp(width_ratio / aspect_scale, 0.03, 0.80)
-    if robot.footprint_length_ratio is None:
-        aspect_scale = _clamp((reference_aspect / frame_aspect) ** 0.10, 0.92, 1.08)
-        length_ratio = _clamp(length_ratio * aspect_scale, 0.03, 0.60)
-
-    rect_width = max(1, int(round(width * width_ratio)))
-    rect_height = max(1, int(round(height * length_ratio)))
-    left = max(0, width // 2 - rect_width // 2)
-    right = min(width, left + rect_width)
-    top = max(0, height - rect_height)
+    width_ratio, height_ratio = robot.derived_footprint_ratios()
+    grid_width = width * width_ratio
+    grid_height = height * height_ratio
+    left = max(0, int((width // 2) - (grid_width // 2)))
+    right = min(width, int((width // 2) + (grid_width // 2)))
+    top = max(0, int(height - grid_height))
     bottom = height
 
     seed_x_min = _clamp(0.5 - width_ratio / 2.0, 0.0, 1.0)
     seed_x_max = _clamp(0.5 + width_ratio / 2.0, 0.0, 1.0)
-    seed_y = _clamp(1.0 - length_ratio / 2.0, 0.0, 1.0)
+    seed_y = _clamp(1.0 - height_ratio / 2.0, 0.0, 1.0)
 
     return RobotImageAlignment(
         frame_width=int(width),
         frame_height=int(height),
-        method="image_normalized_no_intrinsics",
+        method="ventura_pct_bottom_center",
         width_ratio=float(width_ratio),
-        length_ratio=float(length_ratio),
+        length_ratio=float(height_ratio),
         left=int(left),
         right=int(right),
         top=int(top),
@@ -405,7 +541,7 @@ def query_capture_metadata(
     width: int | None = None,
     height: int | None = None,
 ) -> dict[str, Any]:
-    width_ratio, length_ratio = config.robot.derived_footprint_ratios()
+    width_ratio, height_ratio = config.robot.derived_footprint_ratios()
     avt_seed_y, avt_seed_x_min, avt_seed_x_max = config.robot.avt_seed_ratios()
     alignment = (
         align_virtual_robot_to_image(height=height, width=width, robot=config.robot)
@@ -413,15 +549,15 @@ def query_capture_metadata(
         else None
     )
     return {
-        "schema": "avt_query_capture_v2",
+        "schema": "avt_ventura_query_capture_v1",
         "numeric_columns": QUERY_NUMERIC_COLUMNS,
         "cotracker_columns": ["reverse_time", "x", "y"],
         "source_codes": QUERY_SOURCE_CODES,
         "mode": config.mode,
-        "virtual_robot": asdict(config.robot)
+        "ventura_footprint": asdict(config.robot)
         | {
-            "derived_footprint_width_ratio": width_ratio,
-            "derived_footprint_length_ratio": length_ratio,
+            "robot_width_pct": width_ratio,
+            "robot_height_pct": height_ratio,
             "derived_avt_seed_y_ratio": avt_seed_y,
             "derived_avt_seed_x_min_ratio": avt_seed_x_min,
             "derived_avt_seed_x_max_ratio": avt_seed_x_max,
@@ -431,49 +567,26 @@ def query_capture_metadata(
     }
 
 
-def _sift_times(frame_count: int, temporal_stride: int) -> list[int]:
+def _sift_times(frame_count: int, window_size: int) -> list[int]:
     if frame_count <= 1:
         return [0]
-    num_windows = max(1, frame_count // temporal_stride)
+    num_windows = max(1, frame_count // window_size)
     idxs = np.linspace(0, frame_count - 1, num=num_windows, dtype=int)
     idxs = np.concatenate(([0], idxs, [max(0, frame_count - 2)]))
     return sorted({int(idx) for idx in idxs if 0 <= idx < frame_count})
 
 
 def _validate_mode(mode: str) -> str:
-    if mode not in {"avt", "sift", "avt+sift"}:
-        raise ValueError("query_mode must be one of: avt, sift, avt+sift")
+    if mode not in {"ventura", "avt", "sift", "avt+sift"}:
+        raise ValueError("query_mode must be one of: ventura, avt, sift, avt+sift")
     return mode
 
 
-def _meters(data: dict[str, Any], base: str, default: float) -> float:
-    if f"{base}_m" in data:
-        return float(data[f"{base}_m"])
-    if f"{base}_cm" in data:
-        return float(data[f"{base}_cm"]) / 100.0
-    return float(data.get(base, default))
-
-
-def _optional_meters(data: dict[str, Any], base: str, default: float | None) -> float | None:
-    if f"{base}_m" in data:
-        value = data[f"{base}_m"]
-    elif f"{base}_cm" in data:
-        value = data[f"{base}_cm"]
-        if value is None:
-            return None
-        return float(value) / 100.0
-    else:
-        value = data.get(base, default)
-    if value is None:
-        return None
-    return float(value)
-
-
-def _optional_float(data: dict[str, Any], key: str) -> float | None:
-    value = data.get(key)
-    if value is None:
-        return None
-    return float(value)
+def _ratio_value(data: dict[str, Any], keys: tuple[str, ...], default: float) -> float:
+    for key in keys:
+        if data.get(key) is not None:
+            return float(data[key])
+    return float(default)
 
 
 def _as_bool(value: Any) -> bool:
@@ -482,12 +595,6 @@ def _as_bool(value: Any) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
-
-
-def _positive(value: float, name: str) -> float:
-    if value <= 0:
-        raise ValueError(f"{name} must be positive")
-    return value
 
 
 def _clamp(value: float, lower: float, upper: float) -> float:

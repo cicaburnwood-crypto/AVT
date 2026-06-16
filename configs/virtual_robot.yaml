@@ -1,23 +1,32 @@
-query_mode: avt+sift
+query_mode: ventura
 
-virtual_robot:
-  # Approximate robot dimensions are enough. AVT does not require camera intrinsics.
-  width_cm: 40
-  length_cm: 60
-  # Optional weak prior only; set to null if the source video camera height is unknown.
-  camera_height_cm: 18
-  # Leave footprint ratios unset to derive them from the virtual robot geometry.
-  # footprint_width_ratio: 0.25
-  # footprint_length_ratio: 0.20
+footprint:
+  # VENTURA uses normalized image-space scale, not physical robot calibration.
+  # These match ROBOT_WIDTH_PCT and ROBOT_HEIGHT_PCT in the original pipeline.
+  width_ratio: 0.20
+  height_ratio: 0.15
 
 sift:
   enabled: true
-  # In avt+sift mode this is the total target: SIFT first, AVT fills any shortage.
+  # Robot-footprint crumbs: VENTURA samples one SIFT frame per this many frames.
   max_query_points: 384
-  temporal_stride: 3
+  window_size: 20
   sample_at_edges: true
-  edge_offset_ratio: 0.15
+  edge_offset_ratio: 0.10
+  use_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: 8
   n_octave_layers: 7
   contrast_threshold: 0.02
   edge_threshold: 18.0
   sigma: 1.6
+
+  # Full-frame anchors are tracked with the crumbs, then excluded from path masks.
+  anchors:
+    enabled: true
+    max_query_points: 384
+    window_size: 20
+    n_octave_layers: 3
+    contrast_threshold: 0.008
+    edge_threshold: 15.0
+    sigma: 1.2

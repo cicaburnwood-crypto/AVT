@@ -13,6 +13,7 @@ from .querying import (
     align_virtual_robot_to_image,
     build_avt_queries,
     build_sift_queries,
+    build_ventura_queries,
     query_artifact_arrays,
     query_capture_metadata,
 )
@@ -74,9 +75,20 @@ def build_queries(
     queries: list[QueryPoint] = []
     mode = config.query_config.mode
     seed_y_ratio, seed_x_min_ratio, seed_x_max_ratio = _avt_seed_ratios(config, width, height)
-    want_sift = mode in {"sift", "avt+sift"} or config.query_config.sift.enabled
+    want_ventura = mode in {"ventura", "avt+sift"}
+    want_sift = mode == "sift"
 
-    if want_sift:
+    if want_ventura:
+        if frames_rgb is None:
+            raise ValueError("frames_rgb is required for VENTURA query capture")
+        queries.extend(
+            build_ventura_queries(
+                frames_rgb=frames_rgb,
+                query_config=config.query_config,
+                start_id=len(queries),
+            )
+        )
+    elif want_sift:
         if frames_rgb is None:
             raise ValueError("frames_rgb is required for SIFT query capture")
         queries.extend(
@@ -101,36 +113,35 @@ def build_queries(
                 start_id=len(queries),
             )
         )
-    elif mode == "avt+sift":
-        shortage = config.query_config.sift.max_query_points - len(queries)
-        if shortage > 0:
-            queries.extend(
-                build_avt_queries(
-                    width=width,
-                    height=height,
-                    frame_count=frame_count,
-                    query_stride=config.query_stride,
-                    seed_count=config.seed_count,
-                    seed_y_ratio=seed_y_ratio,
-                    seed_x_min_ratio=seed_x_min_ratio,
-                    seed_x_max_ratio=seed_x_max_ratio,
-                    start_id=len(queries),
-                    max_points=shortage,
-                )
-            )
 
-    if not queries and mode == "sift":
-        raise ValueError("No SIFT query points were generated")
+    if not queries and mode in {"ventura", "sift", "avt+sift"}:
+        raise ValueError("No VENTURA/SIFT query points were generated")
 
     if not queries:
         raise ValueError("No query points were generated")
     return queries
 
 
-def reference_mask(bundle: TrackingBundle, height: int, width: int) -> np.ndarray:
+def reference_mask(
+    bundle: TrackingBundle,
+    height: int,
+    width: int,
+    queries: list[QueryPoint] | None = None,
+) -> np.ndarray:
     """Cyan RGBA mask on the original reference frame for a window."""
 
-    points = bundle.tracks[-1, bundle.visibility[-1]]
+    if queries is None:
+        point_indices = np.arange(bundle.tracks.shape[1])
+    else:
+        point_indices = np.array(
+            [query.id for query in queries if query.source != "sift_anchor"],
+            dtype=np.int64,
+        )
+    if point_indices.size:
+        visible = bundle.visibility[-1, point_indices]
+        points = bundle.tracks[-1, point_indices][visible]
+    else:
+        points = np.empty((0, 2), dtype=np.float32)
     points = points[np.isfinite(points).all(axis=1)]
     alpha = np.zeros((height, width), dtype=np.uint8)
     if len(points) >= 3:
@@ -167,7 +178,7 @@ def write_window_artifacts(
         **query_arrays,
     )
 
-    mask_rgba = reference_mask(bundle, h, w)
+    mask_rgba = reference_mask(bundle, h, w, queries)
     cv2.imwrite(str(window_dir / "path_mask_reference.png"), cv2.cvtColor(mask_rgba, cv2.COLOR_RGBA2BGRA))
 
     if config.save_reverse_video:
@@ -184,7 +195,7 @@ def write_window_artifacts(
         "fps": float(config.fps),
         "query_count": len(queries),
         "query_capture": query_capture_metadata(config.query_config, width=w, height=h),
-        "resolved_avt_seed": {
+        "resolved_pct_seed": {
             "y_ratio": seed_y_ratio,
             "x_min_ratio": seed_x_min_ratio,
             "x_max_ratio": seed_x_max_ratio,
