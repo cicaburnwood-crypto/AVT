@@ -11,7 +11,7 @@ from avt.cli import (
     _create_unique_run_dir,
     build_parser,
 )
-from avt.inverse import InverseTrackConfig, build_queries, run_inverse_tracking
+from avt.inverse import InverseTrackConfig, build_queries, reference_mask, run_inverse_tracking
 from avt.io import read_frame_records
 from avt.querying import (
     QueryConfig,
@@ -23,8 +23,10 @@ from avt.querying import (
     query_config_from_mapping,
     robot_sift_mask,
 )
-from avt.schema import QueryPoint, TrackerInfo
+from avt.schema import QueryPoint, TrackerInfo, WindowSpec
 from avt.tracking.base import TrackingBundle
+from avt.tracking.foundationpose import FoundationPoseBackend
+from avt.tracking.foundationpose.download import FOUNDATIONPOSE_WEIGHT_FILES
 from avt.viewer import build_viewer
 
 
@@ -157,6 +159,8 @@ def test_query_config_from_yaml_mapping() -> None:
     assert config.robot.height_ratio == 0.20
     assert config.sift.max_query_points == 384
     assert config.sift.window_size == 20
+    assert config.sift.min_points_per_frame == 8
+    assert config.sift.max_points_per_frame == 20
     assert config.sift.anchors.max_query_points == 192
 
 
@@ -185,6 +189,77 @@ def test_cli_output_defaults() -> None:
     assert viewer_args.viewer_dir == DEFAULT_VIEWER_ROOT
 
 
+def test_cli_accepts_foundationpose_backend() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "track",
+            "--frames-root",
+            "/tmp/frames",
+            "--backend",
+            "foundationpose",
+            "--foundationpose-transforms",
+            "/tmp/fp_transforms.npz",
+        ]
+    )
+
+    assert args.backend == "foundationpose"
+    assert args.foundationpose_transforms == Path("/tmp/fp_transforms.npz")
+
+
+def test_foundationpose_homography_adapter(tmp_path: Path) -> None:
+    weights = tmp_path / "weights"
+    for rel in FOUNDATIONPOSE_WEIGHT_FILES:
+        path = weights / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test")
+
+    homographies = np.repeat(np.eye(3, dtype=np.float32)[None], 4, axis=0)
+    homographies[:, 0, 2] = [0, 2, 4, 6]
+    transforms = tmp_path / "transforms.npz"
+    np.savez_compressed(transforms, homographies_reverse=homographies)
+
+    frames = np.zeros((4, 20, 30, 3), dtype=np.uint8)
+    queries = [
+        QueryPoint(id=0, reverse_time=0, x=5, y=6, side=-1),
+        QueryPoint(id=1, reverse_time=2, x=10, y=8, side=1),
+    ]
+    tracker = FoundationPoseBackend(weights_dir=weights, transforms_path=transforms)
+
+    bundle = tracker.track(frames, queries)
+
+    assert bundle.tracker.name == "foundationpose"
+    assert bundle.visibility[:, 0].tolist() == [True, True, True, True]
+    assert bundle.visibility[:, 1].tolist() == [False, False, True, True]
+    assert bundle.tracks[:, 0, 0].tolist() == [5, 7, 9, 11]
+    assert np.isnan(bundle.tracks[:2, 1]).all()
+    assert bundle.tracks[2:, 1, 0].tolist() == [10, 12]
+
+
+def test_foundationpose_transform_directory_uses_window_context(tmp_path: Path) -> None:
+    weights = tmp_path / "weights"
+    for rel in FOUNDATIONPOSE_WEIGHT_FILES:
+        path = weights / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"test")
+
+    transforms_dir = tmp_path / "transforms"
+    transforms_dir.mkdir()
+    homographies = np.repeat(np.eye(3, dtype=np.float32)[None], 3, axis=0)
+    homographies[:, 1, 2] = [0, 1, 2]
+    np.savez_compressed(transforms_dir / "seq_0_3.npz", homographies_reverse=homographies)
+
+    tracker = FoundationPoseBackend(weights_dir=weights, transforms_path=transforms_dir)
+    tracker.set_window_context(window=WindowSpec(start=0, end=3), output_dir=tmp_path)
+    frames = np.zeros((3, 20, 30, 3), dtype=np.uint8)
+    queries = [QueryPoint(id=0, reverse_time=0, x=5, y=6, side=-1)]
+
+    bundle = tracker.track(frames, queries)
+
+    assert bundle.tracks[:, 0, 1].tolist() == [6, 7, 8]
+
+
 def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
     frames_root = tmp_path / "frames"
     write_frames(frames_root)
@@ -209,3 +284,16 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
     assert payload["metadata"]["successful_windows"] == 1
     assert (viewer_dir / "index.html").exists()
     assert (viewer_dir / "data" / "prediction_tracks.json").exists()
+
+
+def test_reference_mask_uses_support_points() -> None:
+    bundle = TrackingBundle(
+        tracks=np.empty((2, 0, 2), dtype=np.float32),
+        visibility=np.empty((2, 0), dtype=bool),
+        tracker=TrackerInfo(name="fake"),
+    )
+    support = np.array([[10, 30], [30, 30], [20, 15]], dtype=np.float32)
+
+    mask = reference_mask(bundle, height=40, width=50, queries=[], support_points=support)
+
+    assert mask[..., 3].sum() > 0

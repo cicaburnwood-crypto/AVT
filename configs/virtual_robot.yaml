@@ -3,29 +3,33 @@ query_mode: ventura
 footprint:
   # VENTURA uses normalized image-space scale, not physical robot calibration.
   # These match ROBOT_WIDTH_PCT and ROBOT_HEIGHT_PCT in the original pipeline.
-  width_ratio: 0.20
-  height_ratio: 0.15
+  width_ratio: 0.25
+  height_ratio: 0.20
 
 sift:
   enabled: true
   # Robot-footprint crumbs: VENTURA samples one SIFT frame per this many frames.
-  max_query_points: 384
+  max_query_points: 768
   window_size: 20
+  min_points_per_frame: 8
+  max_points_per_frame: 20
   sample_at_edges: true
   edge_offset_ratio: 0.10
   use_clahe: true
   clahe_clip_limit: 2.0
   clahe_tile_grid_size: 8
-  n_octave_layers: 7
-  contrast_threshold: 0.02
-  edge_threshold: 18.0
-  sigma: 1.6
+  n_octave_layers: 5
+  contrast_threshold: 0.018
+  edge_threshold: 20.0
+  sigma: 1.5
 
   # Full-frame anchors are tracked with the crumbs, then excluded from path masks.
   anchors:
     enabled: true
-    max_query_points: 384
+    max_query_points: 512
     window_size: 20
+    min_points_per_frame: 8
+    max_points_per_frame: 20
     n_octave_layers: 3
     contrast_threshold: 0.008
     edge_threshold: 15.0

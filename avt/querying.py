@@ -36,8 +36,8 @@ QUERY_NUMERIC_COLUMNS = [
 class VirtualRobotConfig:
     """VENTURA-style bottom-center robot footprint in normalized image units."""
 
-    width_ratio: float = 0.20
-    height_ratio: float = 0.15
+    width_ratio: float = 0.25
+    height_ratio: float = 0.20
 
     def derived_footprint_ratios(self) -> tuple[float, float]:
         return _clamp(self.width_ratio, 0.03, 0.80), _clamp(self.height_ratio, 0.03, 0.60)
@@ -83,6 +83,8 @@ class SiftAnchorConfig:
     enabled: bool = True
     max_query_points: int = 384
     window_size: int | None = None
+    min_points_per_frame: int = 8
+    max_points_per_frame: int = 20
     n_octave_layers: int = 3
     contrast_threshold: float = 0.008
     edge_threshold: float = 15.0
@@ -96,12 +98,14 @@ class SiftCaptureConfig:
     enabled: bool = True
     max_query_points: int = 384
     window_size: int = 20
+    min_points_per_frame: int = 8
+    max_points_per_frame: int = 20
     sample_at_edges: bool = True
     edge_offset_ratio: float = 0.10
-    n_octave_layers: int = 7
-    contrast_threshold: float = 0.02
-    edge_threshold: float = 18.0
-    sigma: float = 1.6
+    n_octave_layers: int = 5
+    contrast_threshold: float = 0.018
+    edge_threshold: float = 20.0
+    sigma: float = 1.5
     use_clahe: bool = True
     clahe_clip_limit: float = 2.0
     clahe_tile_grid_size: int = 8
@@ -158,12 +162,12 @@ def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
         width_ratio=_ratio_value(
             robot_data,
             ("width_ratio", "robot_width_pct", "footprint_width_ratio"),
-            0.20,
+            0.25,
         ),
         height_ratio=_ratio_value(
             robot_data,
             ("height_ratio", "robot_height_pct", "footprint_height_ratio", "footprint_length_ratio"),
-            0.15,
+            0.20,
         ),
     )
     anchors = SiftAnchorConfig(
@@ -174,6 +178,8 @@ def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
             if anchor_data.get("window_size") is not None
             else None
         ),
+        min_points_per_frame=int(anchor_data.get("min_points_per_frame", 8)),
+        max_points_per_frame=int(anchor_data.get("max_points_per_frame", 20)),
         n_octave_layers=int(anchor_data.get("n_octave_layers", 3)),
         contrast_threshold=float(anchor_data.get("contrast_threshold", 0.008)),
         edge_threshold=float(anchor_data.get("edge_threshold", 15.0)),
@@ -183,12 +189,14 @@ def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
         enabled=_as_bool(sift_data.get("enabled", mode in {"ventura", "sift", "avt+sift"})),
         max_query_points=int(sift_data.get("max_query_points", 384)),
         window_size=int(sift_data.get("window_size", sift_data.get("temporal_stride", 20))),
+        min_points_per_frame=int(sift_data.get("min_points_per_frame", 8)),
+        max_points_per_frame=int(sift_data.get("max_points_per_frame", 20)),
         sample_at_edges=_as_bool(sift_data.get("sample_at_edges", True)),
         edge_offset_ratio=float(sift_data.get("edge_offset_ratio", 0.10)),
-        n_octave_layers=int(sift_data.get("n_octave_layers", 7)),
-        contrast_threshold=float(sift_data.get("contrast_threshold", 0.02)),
-        edge_threshold=float(sift_data.get("edge_threshold", 18.0)),
-        sigma=float(sift_data.get("sigma", 1.6)),
+        n_octave_layers=int(sift_data.get("n_octave_layers", 5)),
+        contrast_threshold=float(sift_data.get("contrast_threshold", 0.018)),
+        edge_threshold=float(sift_data.get("edge_threshold", 20.0)),
+        sigma=float(sift_data.get("sigma", 1.5)),
         use_clahe=_as_bool(sift_data.get("use_clahe", True)),
         clahe_clip_limit=float(sift_data.get("clahe_clip_limit", 2.0)),
         clahe_tile_grid_size=int(sift_data.get("clahe_tile_grid_size", 8)),
@@ -369,7 +377,7 @@ def _sample_sift_queries(
         edgeThreshold=params.edge_threshold,
         sigma=params.sigma,
     )
-    samples_per_time = max(1, int(max_query_points / len(times)))
+    samples_per_time = _samples_per_time(max_query_points, len(times), params)
     queries: list[QueryPoint] = []
     for reverse_time in times:
         gray = cv2.cvtColor(frames_rgb[reverse_time], cv2.COLOR_RGB2GRAY)
@@ -574,6 +582,19 @@ def _sift_times(frame_count: int, window_size: int) -> list[int]:
     idxs = np.linspace(0, frame_count - 1, num=num_windows, dtype=int)
     idxs = np.concatenate(([0], idxs, [max(0, frame_count - 2)]))
     return sorted({int(idx) for idx in idxs if 0 <= idx < frame_count})
+
+
+def _samples_per_time(
+    max_query_points: int,
+    time_count: int,
+    params: SiftCaptureConfig | SiftAnchorConfig,
+) -> int:
+    if time_count <= 0:
+        return 0
+    base = int(max_query_points / time_count)
+    min_points = max(1, int(params.min_points_per_frame))
+    max_points = max(min_points, int(params.max_points_per_frame))
+    return max(min_points, min(max_points, base))
 
 
 def _validate_mode(mode: str) -> str:

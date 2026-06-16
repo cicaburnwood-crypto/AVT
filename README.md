@@ -20,7 +20,8 @@ python -m pip install -e .
 ```
 
 The default `lk` backend only needs OpenCV and NumPy. The `cotracker` backend
-requires PyTorch and a CoTracker hub-capable environment.
+requires PyTorch and a CoTracker hub-capable environment. The optional
+`foundationpose` backend is an adapter for FoundationPose-derived pose outputs.
 
 ## Run Inverse Tracking
 
@@ -73,24 +74,36 @@ accurate camera height, which keeps it usable for arbitrary internet videos.
 ```yaml
 query_mode: ventura
 footprint:
-  width_ratio: 0.20
-  height_ratio: 0.15
+  width_ratio: 0.25
+  height_ratio: 0.20
 sift:
   enabled: true
   max_query_points: 384
   window_size: 20
+  min_points_per_frame: 8
+  max_points_per_frame: 20
   edge_offset_ratio: 0.10
   use_clahe: true
   anchors:
     enabled: true
     max_query_points: 384
+    min_points_per_frame: 8
+    max_points_per_frame: 20
 ```
 
 The SIFT `window_size` is VENTURA's SIFT sampling interval, separate from the
 tracking `--window-size`. The default crumb SIFT parameters are
-`contrastThreshold=0.02`, `edgeThreshold=18`, `nOctaveLayers=7`, `sigma=1.6`;
+`contrastThreshold=0.018`, `edgeThreshold=20`, `nOctaveLayers=5`, `sigma=1.5`;
 anchor SIFT uses `contrastThreshold=0.008`, `edgeThreshold=15`,
-`nOctaveLayers=3`, `sigma=1.2`. Both use CLAHE before SIFT by default.
+`nOctaveLayers=3`, `sigma=1.2`. Both use CLAHE before SIFT by default. Like
+VENTURA, AVT clamps each selected SIFT frame to 8-20 query points so long
+tracking windows do not become under-seeded.
+
+The displayed reference-frame path mask also uses VENTURA-style support crumbs:
+extra relaxed SIFT points are sampled on the bottom robot footprint of the
+reference frame and used only to draw the mask. Disable this with
+`--no-path-support`, or tune it with `--path-support-min-points` and
+`--path-support-fraction`.
 
 By default, each CLI run writes into a fresh child directory under
 `/home/wolfie/Project/Cyber_Guider/AVT/outputs`, for example
@@ -105,6 +118,47 @@ python -m http.server 8780 -d /home/wolfie/Project/Cyber_Guider/AVT/outputs/run_
 ```
 
 Open `http://127.0.0.1:8780/`.
+
+## FoundationPose Backend
+
+FoundationPose is available as a separate selectable backbone:
+
+```bash
+python -m avt.tracking.foundationpose.download
+
+avt all \
+  --frames-root /path/to/recording_or_images \
+  --backend foundationpose \
+  --foundationpose-transforms /path/to/foundationpose_transforms.npz \
+  --query-mode ventura \
+  --robot-config configs/virtual_robot.yaml
+```
+
+This keeps the original CoTracker/LK pipeline intact. AVT still extracts the
+same VENTURA-aligned SIFT anchor and robot-footprint query points; the
+FoundationPose backend converts pose-derived image transforms into AVT point
+tracks.
+
+FoundationPose itself is not an RGB-only point tracker. A real FoundationPose
+run needs RGB-D frames, object masks, camera intrinsics, and CAD/reference object
+data. The AVT backend expects one of these pose-derived files:
+
+- `.npz` with `tracks_reverse` and optional `visibility_reverse`
+- `.npz` or `.json` with `homographies_reverse` or `homographies`, shaped
+  `[T, 3, 3]`
+
+For multi-window runs, `--foundationpose-transforms` may point to a directory
+containing per-window files such as `seq_0_240.npz`, `seq_60_300.npz`, or nested
+files like `seq_0_240/transforms.npz`.
+
+Homographies are absolute transforms from reverse frame 0 to each reverse frame.
+For a query inserted at reverse time `q`, AVT applies `H[t] @ inv(H[q])` so the
+same query schema works with either CoTracker or FoundationPose-derived motion.
+
+The FoundationPose weights are stored outside git under
+`checkpoints/foundationpose/`. The downloader fetches the refiner
+`2023-10-28-18-33-37/model_best.pth` and scorer
+`2024-01-11-20-02-45/model_best.pth` checkpoints.
 
 ## Build Viewer From Existing Tracks
 

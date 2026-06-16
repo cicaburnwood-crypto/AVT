@@ -78,6 +78,14 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument("--no-reverse-video", action="store_true")
+    parser.add_argument(
+        "--path-support",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use VENTURA-style relaxed SIFT support points when drawing the reference path mask.",
+    )
+    parser.add_argument("--path-support-min-points", type=int, default=32)
+    parser.add_argument("--path-support-fraction", type=int, default=6)
 
 
 def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
@@ -99,6 +107,9 @@ def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
         query_config=query_config,
         max_windows=args.max_windows,
         save_reverse_video=not args.no_reverse_video,
+        path_support_enabled=args.path_support,
+        path_support_min_points=args.path_support_min_points,
+        path_support_fraction=args.path_support_fraction,
     )
 
 
@@ -114,6 +125,15 @@ def _tracker_from_args(args: argparse.Namespace):
             torch_home=args.torch_home,
             hub_repo=args.cotracker_hub_repo,
             hub_model=args.cotracker_hub_model,
+        )
+    if args.backend == "foundationpose":
+        from .tracking.foundationpose import FoundationPoseBackend
+
+        return FoundationPoseBackend(
+            weights_dir=args.foundationpose_weights_dir,
+            transforms_path=args.foundationpose_transforms,
+            download_weights=args.foundationpose_download_weights,
+            device=args.foundationpose_device,
         )
     raise ValueError(f"Unknown backend: {args.backend}")
 
@@ -216,6 +236,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def add_tracker_args(cmd: argparse.ArgumentParser) -> None:
+        cmd.add_argument("--backend", choices=("lk", "cotracker", "foundationpose"), default="lk")
+        cmd.add_argument("--cotracker-device", default="auto")
+        cmd.add_argument("--cotracker-batch-size", type=int, default=256)
+        cmd.add_argument("--cotracker-hub-repo", default="facebookresearch/co-tracker")
+        cmd.add_argument("--cotracker-hub-model", default="cotracker3_offline")
+        cmd.add_argument("--torch-home", default=None)
+        cmd.add_argument("--foundationpose-device", default="auto")
+        cmd.add_argument(
+            "--foundationpose-weights-dir",
+            type=Path,
+            default=None,
+            help="FoundationPose weights root. Defaults to checkpoints/foundationpose.",
+        )
+        cmd.add_argument(
+            "--foundationpose-download-weights",
+            action="store_true",
+            help="Download missing FoundationPose refiner/scorer weights before tracking.",
+        )
+        cmd.add_argument(
+            "--foundationpose-transforms",
+            type=Path,
+            default=None,
+            help=(
+                "FoundationPose-derived .npz/.json containing homographies_reverse "
+                "or direct tracks_reverse for this AVT window."
+            ),
+        )
+
     track = sub.add_parser("track", help="Run inverse-video point tracking.")
     _add_source_args(track)
     _add_inverse_args(track)
@@ -225,12 +274,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_ROOT,
         help=f"Base directory for unique run outputs. Default: {DEFAULT_OUTPUT_ROOT}",
     )
-    track.add_argument("--backend", choices=("lk", "cotracker"), default="lk")
-    track.add_argument("--cotracker-device", default="auto")
-    track.add_argument("--cotracker-batch-size", type=int, default=256)
-    track.add_argument("--cotracker-hub-repo", default="facebookresearch/co-tracker")
-    track.add_argument("--cotracker-hub-model", default="cotracker3_offline")
-    track.add_argument("--torch-home", default=None)
+    add_tracker_args(track)
     track.set_defaults(func=cmd_track)
 
     viewer = sub.add_parser("viewer", help="Build the static WebUI from AVT artifacts.")
@@ -262,12 +306,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional base directory for unique viewer outputs.",
     )
-    all_cmd.add_argument("--backend", choices=("lk", "cotracker"), default="lk")
-    all_cmd.add_argument("--cotracker-device", default="auto")
-    all_cmd.add_argument("--cotracker-batch-size", type=int, default=256)
-    all_cmd.add_argument("--cotracker-hub-repo", default="facebookresearch/co-tracker")
-    all_cmd.add_argument("--cotracker-hub-model", default="cotracker3_offline")
-    all_cmd.add_argument("--torch-home", default=None)
+    add_tracker_args(all_cmd)
     all_cmd.add_argument("--max-points-per-frame", type=int, default=0)
     all_cmd.add_argument("--copy-frames", action="store_true")
     all_cmd.add_argument("--video-base-url", default="")
