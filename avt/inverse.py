@@ -34,7 +34,8 @@ class InverseTrackConfig:
     seed_x_max_ratio: float | None = None
     query_config: QueryConfig = field(default_factory=QueryConfig)
     max_windows: int | None = None
-    save_reverse_video: bool = True
+    save_reverse_video: bool = False
+    save_path_mask: bool = False
     path_support_enabled: bool = True
     path_support_min_points: int = 32
     path_support_fraction: int = 6
@@ -222,9 +223,14 @@ def write_window_artifacts(
         **query_arrays,
     )
 
-    support_points = _reference_support_points(frames_rgb[0], config)
-    mask_rgba = reference_mask(bundle, h, w, queries, support_points=support_points)
-    cv2.imwrite(str(window_dir / "path_mask_reference.png"), cv2.cvtColor(mask_rgba, cv2.COLOR_RGBA2BGRA))
+    support_points = np.empty((0, 2), dtype=np.float32)
+    if config.save_path_mask:
+        support_points = _reference_support_points(frames_rgb[0], config)
+        mask_rgba = reference_mask(bundle, h, w, queries, support_points=support_points)
+        cv2.imwrite(
+            str(window_dir / "path_mask_reference.png"),
+            cv2.cvtColor(mask_rgba, cv2.COLOR_RGBA2BGRA),
+        )
 
     if config.save_reverse_video:
         write_mp4(window_dir / "reverse_video.mp4", frames_rgb[::-1].copy(), config.fps)
@@ -261,7 +267,7 @@ def write_window_artifacts(
         },
         "files": {
             "tracks": "tracks.npz",
-            "mask": "path_mask_reference.png",
+            "mask": "path_mask_reference.png" if config.save_path_mask else None,
             "reverse_video": "reverse_video.mp4" if config.save_reverse_video else None,
         },
         "time_order": {

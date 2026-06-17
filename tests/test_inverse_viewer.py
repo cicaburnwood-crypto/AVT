@@ -187,6 +187,23 @@ def test_cli_output_defaults() -> None:
     assert track_args.output_root == DEFAULT_OUTPUT_ROOT
     assert all_args.output_root == DEFAULT_OUTPUT_ROOT
     assert viewer_args.viewer_dir == DEFAULT_VIEWER_ROOT
+    assert track_args.save_reverse_video is False
+    assert track_args.save_path_mask is False
+    assert all_args.build_viewer is False
+
+    debug_args = parser.parse_args(
+        [
+            "all",
+            "--frames-root",
+            "/tmp/frames",
+            "--save-reverse-video",
+            "--save-path-mask",
+            "--build-viewer",
+        ]
+    )
+    assert debug_args.save_reverse_video is True
+    assert debug_args.save_path_mask is True
+    assert debug_args.build_viewer is True
 
 
 def test_cli_accepts_foundationpose_backend() -> None:
@@ -278,6 +295,8 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
     assert len(windows) == 1
     assert (output_root / "windows" / "seq_0_4" / "tracks.npz").exists()
     assert (output_root / "windows" / "seq_0_4" / "window.json").exists()
+    assert not (output_root / "windows" / "seq_0_4" / "reverse_video.mp4").exists()
+    assert not (output_root / "windows" / "seq_0_4" / "path_mask_reference.png").exists()
 
     viewer_dir = tmp_path / "viewer"
     payload = build_viewer(frames_root, records, output_root, viewer_dir)

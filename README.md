@@ -41,6 +41,11 @@ avt all \
   --fps 10
 ```
 
+By default, tracking writes only the minimum AVT artifacts needed to rebuild
+analysis or visualization later: `run.json`, each window's `window.json`, and
+compressed `tracks.npz`. It does not write reverse videos, per-window mask PNGs,
+or a WebUI unless explicitly requested.
+
 For a quick CPU smoke test without CoTracker:
 
 ```bash
@@ -99,25 +104,33 @@ anchor SIFT uses `contrastThreshold=0.008`, `edgeThreshold=15`,
 VENTURA, AVT clamps each selected SIFT frame to 8-20 query points so long
 tracking windows do not become under-seeded.
 
-The displayed reference-frame path mask also uses VENTURA-style support crumbs:
-extra relaxed SIFT points are sampled on the bottom robot footprint of the
-reference frame and used only to draw the mask. Disable this with
-`--no-path-support`, or tune it with `--path-support-min-points` and
-`--path-support-fraction`.
+When `--save-path-mask` is enabled, the displayed reference-frame path mask also
+uses VENTURA-style support crumbs: extra relaxed SIFT points are sampled on the
+bottom robot footprint of the reference frame and used only to draw the mask.
+Disable support crumbs with `--no-path-support`, or tune them with
+`--path-support-min-points` and `--path-support-fraction`.
 
 By default, each CLI run writes into a fresh child directory under
 `/home/wolfie/Project/Cyber_Guider/AVT/outputs`, for example
 `/home/wolfie/Project/Cyber_Guider/AVT/outputs/run_20260615_120501_123456`.
 Pass `--output-root` to use a different base directory. The command prints the
-resolved `output_root` and viewer path when it finishes.
+resolved `output_root` when it finishes. Add `--build-viewer` if you want `avt
+all` to build the static WebUI immediately.
 
-Serve the generated viewer:
+Build and serve the viewer only when needed:
 
 ```bash
-python -m http.server 8780 -d /home/wolfie/Project/Cyber_Guider/AVT/outputs/run_20260615_120501_123456/viewer
+avt viewer \
+  --frames-root /path/to/recording_or_images \
+  --tracking-root /home/wolfie/Project/Cyber_Guider/AVT/outputs/run_20260615_120501_123456
 ```
 
-Open `http://127.0.0.1:8780/`.
+```bash
+python -m http.server 8780 -d /path/printed/by/avt/viewer
+```
+
+Use the `viewer` path printed by the command as the `-d` directory, then open
+`http://127.0.0.1:8780/`.
 
 ## FoundationPose Backend
 
@@ -186,9 +199,14 @@ Each CLI run creates a unique run directory. Each tracked window is written to:
       seq_000_250/
         window.json
         tracks.npz
-        path_mask_reference.png
-        reverse_video.mp4
 ```
+
+Optional debug outputs are opt-in:
+
+- `--save-reverse-video` writes `reverse_video.mp4` for each window.
+- `--save-path-mask` writes `path_mask_reference.png` for each window.
+- `--build-viewer` makes `avt all` build the WebUI immediately. Otherwise use
+  `avt viewer` later against the saved tracking directory.
 
 `tracks.npz` contains:
 

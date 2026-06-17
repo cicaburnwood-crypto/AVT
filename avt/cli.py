@@ -77,7 +77,23 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
         help="YAML file with VENTURA footprint and SIFT query-capture settings.",
     )
     parser.add_argument("--max-windows", type=int, default=None)
-    parser.add_argument("--no-reverse-video", action="store_true")
+    parser.add_argument(
+        "--save-reverse-video",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write per-window reverse_video.mp4 files. Disabled by default to keep outputs small.",
+    )
+    parser.add_argument(
+        "--no-reverse-video",
+        action="store_true",
+        help="Deprecated compatibility flag; reverse videos are already disabled by default.",
+    )
+    parser.add_argument(
+        "--save-path-mask",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write per-window path_mask_reference.png files. Disabled by default.",
+    )
     parser.add_argument(
         "--path-support",
         action=argparse.BooleanOptionalAction,
@@ -106,7 +122,8 @@ def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
         seed_x_max_ratio=args.seed_x_max_ratio,
         query_config=query_config,
         max_windows=args.max_windows,
-        save_reverse_video=not args.no_reverse_video,
+        save_reverse_video=bool(args.save_reverse_video and not args.no_reverse_video),
+        save_path_mask=bool(args.save_path_mask),
         path_support_enabled=args.path_support,
         path_support_min_points=args.path_support_min_points,
         path_support_fraction=args.path_support_fraction,
@@ -192,13 +209,30 @@ def cmd_all(args: argparse.Namespace) -> int:
     records = read_frame_records(args.frames_root, args.source_type)
     tracker = _tracker_from_args(args)
     output_root = _create_unique_run_dir(args.output_root)
-    run_inverse_tracking(
+    windows = run_inverse_tracking(
         source_root=args.frames_root,
         frame_records=records,
         output_dir=output_root,
         tracker=tracker,
         config=_config_from_args(args),
     )
+    if not args.build_viewer:
+        print(
+            json.dumps(
+                {
+                    "output_base": str(args.output_root),
+                    "output_root": str(output_root),
+                    "viewer_base": str(args.viewer_dir) if args.viewer_dir else None,
+                    "viewer": None,
+                    "frames": len(records),
+                    "windows": len(windows),
+                    "viewer_note": "Viewer was not built. Run `avt viewer` or pass --build-viewer when needed.",
+                },
+                indent=2,
+            )
+        )
+        return 0
+
     viewer_dir = (
         _create_unique_run_dir(args.viewer_dir, preferred_name=output_root.name)
         if args.viewer_dir
@@ -307,6 +341,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional base directory for unique viewer outputs.",
     )
     add_tracker_args(all_cmd)
+    all_cmd.add_argument(
+        "--build-viewer",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Build the static WebUI after tracking. Disabled by default to keep runs lightweight.",
+    )
     all_cmd.add_argument("--max-points-per-frame", type=int, default=0)
     all_cmd.add_argument("--copy-frames", action="store_true")
     all_cmd.add_argument("--video-base-url", default="")
