@@ -21,7 +21,9 @@ python -m pip install -e .
 
 The default `lk` backend only needs OpenCV and NumPy. The `cotracker` backend
 requires PyTorch and a CoTracker hub-capable environment. The optional
-`foundationpose` backend is an adapter for FoundationPose-derived pose outputs.
+`bootstap` backend is a separate BootsTAPIR adapter using Google DeepMind's
+TAPNet PyTorch implementation. The optional `foundationpose` backend is an
+adapter for FoundationPose-derived pose outputs.
 
 ## Run Inverse Tracking
 
@@ -58,6 +60,47 @@ avt all \
   --query-stride 5 \
   --max-windows 1
 ```
+
+## BootsTAPIR Backend
+
+BootsTAPIR is available as a separate selectable backend, parallel to
+CoTracker:
+
+```bash
+python -m pip install -e '.[bootstap]'
+
+python -m avt.tracking.bootstap.download
+
+avt all \
+  --frames-root /path/to/recording_or_images \
+  --source-type auto \
+  --backend bootstap \
+  --bootstap-config configs/bootstap.yaml \
+  --query-mode ventura \
+  --robot-config configs/virtual_robot.yaml
+```
+
+The backend keeps AVT's query generation and artifact format unchanged. It
+converts AVT's `[reverse_time, x, y]` query points into TAPNet's `[t, y, x]`
+resized raster convention, runs `tapnet.torch.tapir_model.TAPIR`, and converts
+the result back to AVT's `tracks_reverse` and `visibility_reverse` arrays.
+
+BootsTAPIR-specific knobs are namespaced so they do not affect CoTracker:
+
+- `--bootstap-checkpoint`
+- `--bootstap-download-checkpoint` / `--no-bootstap-download-checkpoint`
+- `--bootstap-resize-height` and `--bootstap-resize-width`
+- `--bootstap-query-chunk-size`
+- `--bootstap-pyramid-level`
+- `--bootstap-visibility-threshold`
+- `--bootstap-strict-checkpoint` / `--no-bootstap-strict-checkpoint`
+
+`configs/bootstap.yaml` is an optional backend config. The default checkpoint is
+stored outside git under `checkpoints/bootstap/bootstapir_checkpoint_v2.pt`.
+The checkpoint URL follows the official TAPNet PyTorch BootsTAPIR notebook:
+`https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt`.
+The TAPNet README notes that BootsTAPIR typically performs best at `512x512`,
+which is why the AVT config uses that resize by default.
 
 `--query-mode ventura` is the default. It mirrors VENTURA's image-process
 assumptions: reverse the video window, sample full-frame SIFT anchors for

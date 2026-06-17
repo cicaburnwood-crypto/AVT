@@ -1,0 +1,12 @@
+# Optional backend config for the AVT BootsTAPIR adapter.
+# Used with: avt ... --backend bootstap --bootstap-config configs/bootstap.yaml
+device: auto
+checkpoint_path: null
+checkpoint_url: https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt
+download_checkpoint: false
+resize_height: 512
+resize_width: 512
+query_chunk_size: 64
+pyramid_level: 1
+visibility_threshold: 0.5
+strict_checkpoint: true

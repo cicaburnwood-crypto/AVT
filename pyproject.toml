@@ -24,6 +24,11 @@ foundationpose = [
   "torchvision>=0.15",
   "huggingface-hub>=0.20",
 ]
+bootstap = [
+  "torch>=2.0",
+  "torchvision>=0.15",
+  "tapnet @ git+https://github.com/google-deepmind/tapnet.git",
+]
 dev = [
   "pytest>=8.0",
 ]

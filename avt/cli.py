@@ -152,6 +152,33 @@ def _tracker_from_args(args: argparse.Namespace):
             download_weights=args.foundationpose_download_weights,
             device=args.foundationpose_device,
         )
+    if args.backend == "bootstap":
+        from .tracking.bootstap import (
+            BootstapBackend,
+            BootstapConfig,
+            load_bootstap_config_yaml,
+        )
+        from .tracking.bootstap.config import merge_bootstap_config
+
+        config = (
+            load_bootstap_config_yaml(args.bootstap_config)
+            if args.bootstap_config
+            else BootstapConfig()
+        )
+        config = merge_bootstap_config(
+            config,
+            device=args.bootstap_device,
+            checkpoint_path=args.bootstap_checkpoint,
+            checkpoint_url=args.bootstap_checkpoint_url,
+            download_checkpoint=args.bootstap_download_checkpoint,
+            resize_height=args.bootstap_resize_height,
+            resize_width=args.bootstap_resize_width,
+            query_chunk_size=args.bootstap_query_chunk_size,
+            pyramid_level=args.bootstap_pyramid_level,
+            visibility_threshold=args.bootstap_visibility_threshold,
+            strict_checkpoint=args.bootstap_strict_checkpoint,
+        )
+        return BootstapBackend(**config.__dict__)
     raise ValueError(f"Unknown backend: {args.backend}")
 
 
@@ -271,7 +298,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     def add_tracker_args(cmd: argparse.ArgumentParser) -> None:
-        cmd.add_argument("--backend", choices=("lk", "cotracker", "foundationpose"), default="lk")
+        cmd.add_argument(
+            "--backend",
+            choices=("lk", "cotracker", "foundationpose", "bootstap"),
+            default="lk",
+        )
         cmd.add_argument("--cotracker-device", default="auto")
         cmd.add_argument("--cotracker-batch-size", type=int, default=256)
         cmd.add_argument("--cotracker-hub-repo", default="facebookresearch/co-tracker")
@@ -297,6 +328,37 @@ def build_parser() -> argparse.ArgumentParser:
                 "FoundationPose-derived .npz/.json containing homographies_reverse "
                 "or direct tracks_reverse for this AVT window."
             ),
+        )
+        cmd.add_argument(
+            "--bootstap-config",
+            type=Path,
+            default=None,
+            help="Optional YAML config for the BootsTAPIR backend.",
+        )
+        cmd.add_argument("--bootstap-device", default=None)
+        cmd.add_argument(
+            "--bootstap-checkpoint",
+            type=Path,
+            default=None,
+            help="Path to bootstapir_checkpoint_v2.pt.",
+        )
+        cmd.add_argument("--bootstap-checkpoint-url", default=None)
+        cmd.add_argument(
+            "--bootstap-download-checkpoint",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Download the BootsTAPIR checkpoint if it is missing.",
+        )
+        cmd.add_argument("--bootstap-resize-height", type=int, default=None)
+        cmd.add_argument("--bootstap-resize-width", type=int, default=None)
+        cmd.add_argument("--bootstap-query-chunk-size", type=int, default=None)
+        cmd.add_argument("--bootstap-pyramid-level", type=int, default=None)
+        cmd.add_argument("--bootstap-visibility-threshold", type=float, default=None)
+        cmd.add_argument(
+            "--bootstap-strict-checkpoint",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Use strict checkpoint loading for the BootsTAPIR model.",
         )
 
     track = sub.add_parser("track", help="Run inverse-video point tracking.")

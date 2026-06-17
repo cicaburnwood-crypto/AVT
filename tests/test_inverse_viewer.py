@@ -25,6 +25,8 @@ from avt.querying import (
 )
 from avt.schema import QueryPoint, TrackerInfo, WindowSpec
 from avt.tracking.base import TrackingBundle
+from avt.tracking.bootstap.backend import _query_points_for_resize, _tapnet_outputs_to_avt
+from avt.tracking.bootstap.config import bootstap_config_from_mapping
 from avt.tracking.foundationpose import FoundationPoseBackend
 from avt.tracking.foundationpose.download import FOUNDATIONPOSE_WEIGHT_FILES
 from avt.viewer import build_viewer
@@ -223,6 +225,94 @@ def test_cli_accepts_foundationpose_backend() -> None:
 
     assert args.backend == "foundationpose"
     assert args.foundationpose_transforms == Path("/tmp/fp_transforms.npz")
+
+
+def test_cli_accepts_bootstap_backend() -> None:
+    parser = build_parser()
+
+    args = parser.parse_args(
+        [
+            "track",
+            "--frames-root",
+            "/tmp/frames",
+            "--backend",
+            "bootstap",
+            "--bootstap-config",
+            "configs/bootstap.yaml",
+            "--bootstap-checkpoint",
+            "/tmp/bootstapir_checkpoint_v2.pt",
+            "--bootstap-resize-height",
+            "256",
+            "--bootstap-resize-width",
+            "320",
+        ]
+    )
+
+    assert args.backend == "bootstap"
+    assert args.bootstap_config == Path("configs/bootstap.yaml")
+    assert args.bootstap_checkpoint == Path("/tmp/bootstapir_checkpoint_v2.pt")
+    assert args.bootstap_resize_height == 256
+    assert args.bootstap_resize_width == 320
+
+
+def test_bootstap_config_from_mapping() -> None:
+    config = bootstap_config_from_mapping(
+        {
+            "device": "cpu",
+            "checkpoint_path": "/tmp/bootstapir_checkpoint_v2.pt",
+            "resize_height": 256,
+            "resize_width": 320,
+            "query_chunk_size": 32,
+        }
+    )
+
+    assert config.device == "cpu"
+    assert config.checkpoint_path == Path("/tmp/bootstapir_checkpoint_v2.pt")
+    assert config.resize_height == 256
+    assert config.resize_width == 320
+    assert config.query_chunk_size == 32
+
+
+def test_bootstap_coordinate_adapter() -> None:
+    queries = [
+        QueryPoint(id=0, reverse_time=0, x=20, y=10, side=-1),
+        QueryPoint(id=1, reverse_time=1, x=40, y=30, side=1),
+    ]
+
+    query_points = _query_points_for_resize(
+        queries,
+        source_height=100,
+        source_width=200,
+        resize_height=50,
+        resize_width=100,
+    )
+    assert query_points.tolist() == [[0.0, 5.0, 10.0], [1.0, 15.0, 20.0]]
+
+    tracks = np.array(
+        [
+            [[10, 5], [11, 6], [12, 7]],
+            [[20, 15], [21, 16], [22, 17]],
+        ],
+        dtype=np.float32,
+    )
+    visibility = np.ones((2, 3), dtype=bool)
+
+    tracks_avt, visibility_avt = _tapnet_outputs_to_avt(
+        tracks,
+        visibility,
+        queries,
+        source_height=100,
+        source_width=200,
+        resize_height=50,
+        resize_width=100,
+    )
+
+    assert tracks_avt.shape == (3, 2, 2)
+    assert visibility_avt[:, 0].tolist() == [True, True, True]
+    assert visibility_avt[:, 1].tolist() == [False, True, True]
+    assert tracks_avt[0, 0].tolist() == [20, 10]
+    assert np.isnan(tracks_avt[0, 1]).all()
+    assert tracks_avt[1, 1].tolist() == [42, 32]
 
 
 def test_foundationpose_homography_adapter(tmp_path: Path) -> None:
