@@ -216,10 +216,17 @@ def write_window_artifacts(
     h, w = frames_rgb.shape[1:3]
 
     query_arrays = query_artifact_arrays(queries)
+    track_arrays = {
+        "tracks_reverse": bundle.tracks.astype(np.float32),
+        "visibility_reverse": bundle.visibility.astype(bool),
+    }
+    if bundle.confidence is not None:
+        track_arrays["confidence_reverse"] = bundle.confidence.astype(np.float32)
+    for name, component in bundle.confidence_components.items():
+        track_arrays[f"{name}_reverse"] = component.astype(np.float32)
     np.savez_compressed(
         window_dir / "tracks.npz",
-        tracks_reverse=bundle.tracks.astype(np.float32),
-        visibility_reverse=bundle.visibility.astype(bool),
+        **track_arrays,
         **query_arrays,
     )
 

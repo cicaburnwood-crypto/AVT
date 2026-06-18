@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 
 from .io import link_or_copy
+from .reliability import detect_stationary_sift_frames, frame_reliability, reliability_metadata
 from .schema import FrameRecord
 
 
@@ -70,12 +71,28 @@ def _window_payload(
     arrays = np.load(window_dir / meta["files"]["tracks"])
     tracks = arrays["tracks_reverse"]
     visibility = arrays["visibility_reverse"].astype(bool)
+    confidence = arrays["confidence_reverse"].astype(np.float32) if "confidence_reverse" in arrays else None
+    if confidence is not None and confidence.shape != visibility.shape:
+        raise ValueError(f"confidence_reverse shape {confidence.shape} does not match visibility shape {visibility.shape}")
     queries = arrays["queries"]
     query_records = _query_records(arrays)
 
     seq_start = int(meta["seq_start"])
     seq_end = int(meta["seq_end"])
     t_len, query_count = tracks.shape[:2]
+    query_sources = {
+        int(row[0]): str(query_records.get(int(row[0]), {}).get("source") or _query_source_from_row(row))
+        for row in queries
+    }
+    sift_point_ids = [idx for idx, source in query_sources.items() if source.startswith("sift_")]
+    frame_reasons = detect_stationary_sift_frames(
+        tracks,
+        visibility,
+        seq_start=seq_start,
+        seq_end=seq_end,
+        sift_point_ids=sift_point_ids,
+    )
+    unreliable_frame_indices = sorted(frame_reasons)
 
     crumbs: list[dict[str, Any]] = []
     crumb_count = 0
@@ -84,7 +101,7 @@ def _window_payload(
             break
         idx = int(row[0])
         record = query_records.get(idx, {})
-        source = record.get("source", _query_source_from_row(row))
+        source = query_sources.get(idx, _query_source_from_row(row))
         reverse_time = max(0, min(t_len - 1, int(round(float(row[1])))))
         source_frame = max(0, min(frame_count - 1, seq_end - 1 - reverse_time))
         crumbs.append(
@@ -109,12 +126,32 @@ def _window_payload(
         ids = np.flatnonzero(visibility[reverse_t])
         if max_points_per_frame > 0 and ids.size > max_points_per_frame:
             ids = ids[:max_points_per_frame]
-        points = [
-            [int(idx), round(float(tracks[reverse_t, idx, 0]), 1), round(float(tracks[reverse_t, idx, 1]), 1)]
-            for idx in ids
-            if np.isfinite(tracks[reverse_t, idx]).all()
-        ]
-        frames_out.append({"frame": frame_idx, "reverse_time": int(reverse_t), "points": points})
+        points = []
+        for idx in ids:
+            if not np.isfinite(tracks[reverse_t, idx]).all():
+                continue
+            point = [
+                int(idx),
+                round(float(tracks[reverse_t, idx, 0]), 1),
+                round(float(tracks[reverse_t, idx, 1]), 1),
+            ]
+            if confidence is not None:
+                value = float(confidence[reverse_t, idx])
+                point.append(round(max(0.0, min(1.0, value)), 4) if np.isfinite(value) else None)
+            points.append(point)
+        frames_out.append(
+            {
+                "frame": frame_idx,
+                "reverse_time": int(reverse_t),
+                "points": points,
+                "reliability": frame_reliability(
+                    frame_idx,
+                    points,
+                    unreliable_frame_indices=unreliable_frame_indices,
+                    frame_reasons=frame_reasons,
+                ),
+            }
+        )
 
     video_url = None
     reverse_video = meta["files"].get("reverse_video")
@@ -136,6 +173,7 @@ def _window_payload(
             "valid_only_on_reference_frame": True,
         },
         "video_url": video_url,
+        "point_columns": ["id", "x", "y"] + (["confidence"] if confidence is not None else []),
         "crumbs": crumbs,
         "frames": frames_out,
     }
@@ -199,6 +237,7 @@ def build_payload(
                 "tracker": win["tracker"],
                 "mask": win["mask"],
                 "video_url": win["video_url"],
+                "point_columns": win["point_columns"],
                 "segment": segment_rel,
             }
         )
@@ -212,6 +251,8 @@ def build_payload(
             "successful_windows": len(windows),
             "segmented": True,
             "segment_note": "Window point tracks are loaded on demand from data/windows/*.json.",
+            "reliability_filter": reliability_metadata(),
+            "point_columns": ["id", "x", "y", "confidence"],
             "trackers": trackers,
             "point_semantics": (
                 "Points are backend-neutral inverse-video predictions. "
@@ -266,6 +307,10 @@ HTML = """<!doctype html>
             <option value="4">4x</option>
           </select>
         </label>
+        <label class="reliability-control">Frames <input id="reliabilitySpanInput" type="number" min="2" max="80" step="1" value="10"></label>
+        <label class="reliability-control">Block <input id="reliabilityBlockInput" type="number" min="0.5" max="100" step="0.5" value="6"></label>
+        <label class="reliability-control">Points <input id="reliabilityPointsInput" type="number" min="1" max="100" step="1" value="3"></label>
+        <label class="reliability-control">Segment <input id="reliabilitySegmentInput" type="number" min="1" max="1000" step="1" value="40"></label>
       </div>
       <input id="frameSlider" type="range" min="0" max="0" value="0">
       <div class="toolbar">
@@ -282,6 +327,8 @@ HTML = """<!doctype html>
         <div><span>Time</span><strong id="timeText">-</strong></div>
         <div><span>Window</span><strong id="windowText">-</strong></div>
         <div><span>Visible points</span><strong id="pointsText">-</strong></div>
+        <div><span>Confidence</span><strong id="confidenceText">-</strong></div>
+        <div class="reliability-metric"><span>Reliability</span><strong id="reliabilityText">-</strong></div>
       </div>
       <section class="panel">
         <h2>Window Video</h2>
@@ -304,7 +351,7 @@ HTML = """<!doctype html>
       </section>
     </aside>
   </main>
-  <script src="app.js?v=8"></script>
+  <script src="app.js?v=12"></script>
 </body>
 </html>
 """
@@ -384,6 +431,7 @@ select { padding: 0 8px; }
 input[type="number"] { width: 86px; padding: 0 8px; }
 label { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 14px; }
 .check { color: var(--ink); }
+.reliability-control input[type="number"] { width: 72px; }
 #frameSlider { width: 100%; margin-top: 13px; accent-color: var(--left); }
 .inspector { border-left: 1px solid var(--line); background: #fbfcfd; padding: 16px; min-width: 0; }
 .metrics {
@@ -401,6 +449,7 @@ label { display: inline-flex; align-items: center; gap: 7px; color: var(--muted)
 }
 .metrics span { display: block; color: var(--muted); font-size: 12px; }
 .metrics strong { display: block; margin-top: 5px; font-size: 17px; line-height: 1.1; overflow-wrap: anywhere; }
+.metrics .reliability-metric { grid-column: 1 / -1; }
 .panel { margin-top: 18px; display: flex; flex-direction: column; gap: 12px; }
 .panel video, #pointCanvas {
   width: 100%;
@@ -437,6 +486,8 @@ const frameText = document.getElementById("frameText");
 const timeText = document.getElementById("timeText");
 const windowText = document.getElementById("windowText");
 const pointsText = document.getElementById("pointsText");
+const confidenceText = document.getElementById("confidenceText");
+const reliabilityText = document.getElementById("reliabilityText");
 const selectedText = document.getElementById("selectedText");
 const jumpPointBtn = document.getElementById("jumpPointBtn");
 const windowVideo = document.getElementById("windowVideo");
@@ -548,6 +599,41 @@ function imageToCanvas(pt, fit) {
 function pointColor(crumb) {
   if (crumb.source === "sift_anchor") return "#10b981";
   return crumb.side < 0 ? "#3b82f6" : "#f5b84b";
+}
+
+function pointConfidence(point) {
+  if (!point || point.length < 4) return null;
+  const confidence = Number(point[3]);
+  if (!Number.isFinite(confidence)) return null;
+  return Math.max(0, Math.min(1, confidence));
+}
+
+function formatConfidence(confidence) {
+  return confidence === null ? "unknown" : `${Math.round(confidence * 100)}%`;
+}
+
+function pointAlpha(confidence) {
+  return confidence === null ? 1 : 0.25 + confidence * 0.75;
+}
+
+function pointRadius(confidence, selected) {
+  if (selected) return 6;
+  return confidence === null ? 4 : 2.5 + confidence * 3;
+}
+
+function confidenceSummary(trackSets, loading = false) {
+  if (loading) return "loading";
+  const values = [];
+  trackSets.forEach(({ tracks }) => {
+    if (!tracks) return;
+    tracks.points.forEach((point) => {
+      const confidence = pointConfidence(point);
+      if (confidence !== null) values.push(confidence);
+    });
+  });
+  if (!values.length) return "unknown";
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return `avg ${formatConfidence(avg)} / min ${formatConfidence(Math.min(...values))} / max ${formatConfidence(Math.max(...values))}`;
 }
 
 function median(values) {
@@ -776,6 +862,61 @@ function drawPathCorridor(sections) {
   sourceCtx.stroke();
   sourceCtx.restore();
   return true;
+}
+
+function collectReliability(trackSets) {
+  const records = trackSets
+    .map(({ win, tracks }) => (win ? frameReliability(win, tracks ? tracks.frame : frameIndex) : null))
+    .filter(Boolean);
+  const disabled = records.filter((item) => item.segment_disabled || item.segment_status === "disabled");
+  const reasonCounts = {};
+  const triggerFrames = new Set();
+  disabled.forEach((item) => {
+    (item.trigger_frame_indices || []).forEach((frame) => triggerFrames.add(frame));
+    Object.entries(item.reason_counts || {}).forEach(([reason, count]) => {
+      reasonCounts[reason] = (reasonCounts[reason] || 0) + Number(count || 0);
+    });
+  });
+  return {
+    has: records.length > 0,
+    disabled: disabled.length > 0,
+    frameDisabled: records.some((item) => item.frame_disabled),
+    disabledWindows: disabled.length,
+    totalWindows: records.length,
+    triggerFrames: Array.from(triggerFrames).sort((a, b) => a - b),
+    reasonCounts,
+  };
+}
+
+function reliabilitySummary(stats, loading = false) {
+  if (loading) return "loading";
+  if (!stats || !stats.has) return "unknown";
+  if (!stats.disabled) return "enabled";
+  const reasons = Object.keys(stats.reasonCounts);
+  const reason = reasons.length ? reasons.join(", ") : "disabled";
+  const frames = stats.triggerFrames.slice(0, 3).join(", ");
+  const suffix = frames ? ` / trigger ${frames}` : "";
+  return `DISABLED / ${reason}${suffix}`;
+}
+
+function drawDisabledOverlay(stats) {
+  if (!stats || !stats.disabled) return;
+  const rect = sourceCanvas.getBoundingClientRect();
+  const width = Math.min(rect.width - 28, 620);
+  sourceCtx.save();
+  sourceCtx.fillStyle = "rgba(185, 28, 28, 0.82)";
+  sourceCtx.fillRect(14, 14, width, 72);
+  sourceCtx.strokeStyle = "rgba(255, 255, 255, 0.72)";
+  sourceCtx.lineWidth = 1.5;
+  sourceCtx.strokeRect(14.75, 14.75, width - 1.5, 70.5);
+  sourceCtx.fillStyle = "#ffffff";
+  sourceCtx.font = "700 18px system-ui, sans-serif";
+  sourceCtx.fillText("DISABLED 40-FRAME SEGMENT", 30, 41);
+  sourceCtx.font = "500 13px system-ui, sans-serif";
+  const reason = Object.keys(stats.reasonCounts).join(", ") || "reliability rule";
+  const triggers = stats.triggerFrames.slice(0, 3).join(", ");
+  sourceCtx.fillText(triggers ? `${reason} / trigger ${triggers}` : reason, 30, 66);
+  sourceCtx.restore();
 }
 
 function drawPathOverlay(trackSets, fit) {
@@ -970,6 +1111,7 @@ sourceCanvas.addEventListener("click", (event) => {
   selectedText.textContent =
     `Window ${best.window.id}, point ${best.pointId}. ` +
     `Current frame ${frameIndex}, query source frame ${best.crumb.source_frame}, ` +
+    `confidence ${formatConfidence(best.confidence)}, ` +
     `source ${best.crumb.source || "avt"}, side ${best.crumb.side < 0 ? "left" : "right"}.`;
   drawMain();
   drawSelectedSource();
@@ -989,6 +1131,25 @@ windowSelect.addEventListener("change", () => {
   selectedWindowId = windowSelect.value;
   drawMain();
 });
+
+function updateReliabilitySettingsFromControls() {
+  reliabilitySettings = readReliabilitySettingsFromControls();
+  applyReliabilitySettingsToControls(reliabilitySettings);
+  saveReliabilitySettings(reliabilitySettings);
+  if (data) drawMain();
+}
+
+reliabilitySettings = loadStoredReliabilitySettings();
+applyReliabilitySettingsToControls(reliabilitySettings);
+[
+  reliabilitySpanInput,
+  reliabilityBlockInput,
+  reliabilityPointsInput,
+  reliabilitySegmentInput,
+].forEach((input) => {
+  input.addEventListener("change", updateReliabilitySettingsFromControls);
+});
+
 jumpPointBtn.addEventListener("click", () => {
   if (!selectedPoint) return;
   pause();
@@ -1033,6 +1194,12 @@ const frameText = document.getElementById("frameText");
 const timeText = document.getElementById("timeText");
 const windowText = document.getElementById("windowText");
 const pointsText = document.getElementById("pointsText");
+const confidenceText = document.getElementById("confidenceText");
+const reliabilityText = document.getElementById("reliabilityText");
+const reliabilitySpanInput = document.getElementById("reliabilitySpanInput");
+const reliabilityBlockInput = document.getElementById("reliabilityBlockInput");
+const reliabilityPointsInput = document.getElementById("reliabilityPointsInput");
+const reliabilitySegmentInput = document.getElementById("reliabilitySegmentInput");
 const selectedText = document.getElementById("selectedText");
 const jumpPointBtn = document.getElementById("jumpPointBtn");
 const windowVideo = document.getElementById("windowVideo");
@@ -1051,6 +1218,193 @@ const windowCache = new Map();
 const windowPromises = new Map();
 let pendingMainFrame = null;
 let pendingSelectedFrame = null;
+const RELIABILITY_STORAGE_KEY = "avt.viewer.reliability.thresholds.v1";
+const RELIABILITY_REASON = "stop_extreme_slow_motion";
+const RELIABILITY_DEFAULTS = {
+  spanFrames: 10,
+  blockSizePx: 6,
+  minPoints: 3,
+  segmentSizeFrames: 40,
+};
+let reliabilitySettings = { ...RELIABILITY_DEFAULTS };
+
+function normalizedReliabilitySettings(settings) {
+  const spanFrames = Math.max(2, Math.round(Number(settings.spanFrames) || RELIABILITY_DEFAULTS.spanFrames));
+  const blockSizePx = Math.max(0.5, Number(settings.blockSizePx) || RELIABILITY_DEFAULTS.blockSizePx);
+  const minPoints = Math.max(1, Math.round(Number(settings.minPoints) || RELIABILITY_DEFAULTS.minPoints));
+  const segmentSizeFrames = Math.max(
+    1,
+    Math.round(Number(settings.segmentSizeFrames) || RELIABILITY_DEFAULTS.segmentSizeFrames)
+  );
+  return { spanFrames, blockSizePx, minPoints, segmentSizeFrames };
+}
+
+function loadStoredReliabilitySettings() {
+  let stored = {};
+  try {
+    stored = JSON.parse(window.localStorage.getItem(RELIABILITY_STORAGE_KEY) || "{}");
+  } catch (_error) {
+    stored = {};
+  }
+  const params = new URLSearchParams(window.location.search);
+  return normalizedReliabilitySettings({
+    ...RELIABILITY_DEFAULTS,
+    ...stored,
+    spanFrames: params.get("span") || params.get("reliability_span") || stored.spanFrames,
+    blockSizePx: params.get("block") || params.get("reliability_block") || stored.blockSizePx,
+    minPoints: params.get("points") || params.get("reliability_points") || stored.minPoints,
+    segmentSizeFrames: params.get("segment") || params.get("reliability_segment") || stored.segmentSizeFrames,
+  });
+}
+
+function applyReliabilitySettingsToControls(settings) {
+  reliabilitySpanInput.value = settings.spanFrames;
+  reliabilityBlockInput.value = settings.blockSizePx;
+  reliabilityPointsInput.value = settings.minPoints;
+  reliabilitySegmentInput.value = settings.segmentSizeFrames;
+}
+
+function readReliabilitySettingsFromControls() {
+  return normalizedReliabilitySettings({
+    spanFrames: reliabilitySpanInput.value,
+    blockSizePx: reliabilityBlockInput.value,
+    minPoints: reliabilityPointsInput.value,
+    segmentSizeFrames: reliabilitySegmentInput.value,
+  });
+}
+
+function saveReliabilitySettings(settings) {
+  try {
+    window.localStorage.setItem(RELIABILITY_STORAGE_KEY, JSON.stringify(settings));
+  } catch (_error) {
+    // Local storage is optional; the controls still work for this session.
+  }
+}
+
+function reliabilitySettingsKey(settings) {
+  return [
+    settings.spanFrames,
+    settings.blockSizePx,
+    settings.minPoints,
+    settings.segmentSizeFrames,
+  ].join(":");
+}
+
+function segmentIdForFrame(index, segmentSizeFrames) {
+  return Math.floor(Number(index) / segmentSizeFrames);
+}
+
+function segmentBoundsForFrame(index, segmentSizeFrames) {
+  const start = segmentIdForFrame(index, segmentSizeFrames) * segmentSizeFrames;
+  return { start, end: start + segmentSizeFrames };
+}
+
+function ensurePointMaps(win) {
+  if (win._pointMaps) return win._pointMaps;
+  const maps = new Map();
+  win.frames.forEach((frame) => {
+    const pointMap = new Map();
+    (frame.points || []).forEach((point) => {
+      const x = Number(point[1]);
+      const y = Number(point[2]);
+      if (Number.isFinite(x) && Number.isFinite(y)) pointMap.set(Number(point[0]), point);
+    });
+    maps.set(Number(frame.frame), pointMap);
+  });
+  win._pointMaps = maps;
+  return maps;
+}
+
+function computeWindowReliability(win, settings = reliabilitySettings) {
+  prepareWindow(win);
+  const key = reliabilitySettingsKey(settings);
+  if (win._reliabilityCache && win._reliabilityCache.key === key) return win._reliabilityCache;
+
+  const pointMaps = ensurePointMaps(win);
+  const siftIds = win.crumbs
+    .filter((crumb) => String(crumb.source || "").startsWith("sift_"))
+    .map((crumb) => Number(crumb.id));
+  const frameReasons = new Map();
+  const disabledSegments = new Map();
+  if (siftIds.length) {
+    const firstFrame = Number(win.seq_start) + settings.spanFrames - 1;
+    const lastFrame = Number(win.seq_end) - 1;
+    for (let frame = firstFrame; frame <= lastFrame; frame += 1) {
+      let stationaryCount = 0;
+      for (const id of siftIds) {
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        let valid = true;
+        for (let spanFrame = frame - settings.spanFrames + 1; spanFrame <= frame; spanFrame += 1) {
+          const pointMap = pointMaps.get(spanFrame);
+          const point = pointMap ? pointMap.get(id) : null;
+          if (!point) {
+            valid = false;
+            break;
+          }
+          const x = Number(point[1]);
+          const y = Number(point[2]);
+          if (!Number.isFinite(x) || !Number.isFinite(y)) {
+            valid = false;
+            break;
+          }
+          minX = Math.min(minX, x);
+          maxX = Math.max(maxX, x);
+          minY = Math.min(minY, y);
+          maxY = Math.max(maxY, y);
+        }
+        if (valid && maxX - minX <= settings.blockSizePx && maxY - minY <= settings.blockSizePx) {
+          stationaryCount += 1;
+          if (stationaryCount >= settings.minPoints) {
+            frameReasons.set(frame, [RELIABILITY_REASON]);
+            const segmentId = segmentIdForFrame(frame, settings.segmentSizeFrames);
+            if (!disabledSegments.has(segmentId)) disabledSegments.set(segmentId, []);
+            disabledSegments.get(segmentId).push(frame);
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const cache = { key, frameReasons, disabledSegments };
+  win._reliabilityCache = cache;
+  return cache;
+}
+
+function frameReliability(win, index, settings = reliabilitySettings) {
+  const cache = computeWindowReliability(win, settings);
+  const frame = Number(index);
+  const segmentId = segmentIdForFrame(frame, settings.segmentSizeFrames);
+  const bounds = segmentBoundsForFrame(frame, settings.segmentSizeFrames);
+  const triggerFrames = (cache.disabledSegments.get(segmentId) || []).slice();
+  const frameReasons = cache.frameReasons.get(frame) || [];
+  const reasonCounts = {};
+  triggerFrames.forEach((triggerFrame) => {
+    (cache.frameReasons.get(triggerFrame) || []).forEach((reason) => {
+      reasonCounts[reason] = (reasonCounts[reason] || 0) + 1;
+    });
+  });
+  return {
+    schema: "avt_frame_segment_reliability_v1",
+    filter: "stationary_sift_segment_filter",
+    action: "client_live",
+    segment_size_frames: settings.segmentSizeFrames,
+    segment_id: segmentId,
+    segment_start_frame: bounds.start,
+    segment_end_frame: bounds.end,
+    frame_unreliable: frameReasons.length > 0,
+    segment_unreliable: triggerFrames.length > 0,
+    frame_disabled: frameReasons.length > 0,
+    segment_disabled: triggerFrames.length > 0,
+    segment_status: triggerFrames.length > 0 ? "disabled" : "enabled",
+    trigger_frame_indices: triggerFrames,
+    unreliable_point_ids: [],
+    reason_counts: reasonCounts,
+  };
+}
 
 function frameImage(index) {
   const frame = data.frames[index];
@@ -1206,6 +1560,41 @@ function imageToCanvas(pt, fit) {
 function pointColor(crumb) {
   if (crumb.source === "sift_anchor") return "#10b981";
   return crumb.side < 0 ? "#3b82f6" : "#f5b84b";
+}
+
+function pointConfidence(point) {
+  if (!point || point.length < 4) return null;
+  const confidence = Number(point[3]);
+  if (!Number.isFinite(confidence)) return null;
+  return Math.max(0, Math.min(1, confidence));
+}
+
+function formatConfidence(confidence) {
+  return confidence === null ? "unknown" : `${Math.round(confidence * 100)}%`;
+}
+
+function pointAlpha(confidence) {
+  return confidence === null ? 1 : 0.25 + confidence * 0.75;
+}
+
+function pointRadius(confidence, selected) {
+  if (selected) return 6;
+  return confidence === null ? 4 : 2.5 + confidence * 3;
+}
+
+function confidenceSummary(trackSets, loading = false) {
+  if (loading) return "loading";
+  const values = [];
+  trackSets.forEach(({ tracks }) => {
+    if (!tracks) return;
+    tracks.points.forEach((point) => {
+      const confidence = pointConfidence(point);
+      if (confidence !== null) values.push(confidence);
+    });
+  });
+  if (!values.length) return "unknown";
+  const avg = values.reduce((sum, value) => sum + value, 0) / values.length;
+  return `avg ${formatConfidence(avg)} / min ${formatConfidence(Math.min(...values))} / max ${formatConfidence(Math.max(...values))}`;
 }
 
 function median(values) {
@@ -1436,6 +1825,61 @@ function drawPathCorridor(sections) {
   return true;
 }
 
+function collectReliability(trackSets) {
+  const records = trackSets
+    .map(({ win, tracks }) => (win ? frameReliability(win, tracks ? tracks.frame : frameIndex) : null))
+    .filter(Boolean);
+  const disabled = records.filter((item) => item.segment_disabled || item.segment_status === "disabled");
+  const reasonCounts = {};
+  const triggerFrames = new Set();
+  disabled.forEach((item) => {
+    (item.trigger_frame_indices || []).forEach((frame) => triggerFrames.add(frame));
+    Object.entries(item.reason_counts || {}).forEach(([reason, count]) => {
+      reasonCounts[reason] = (reasonCounts[reason] || 0) + Number(count || 0);
+    });
+  });
+  return {
+    has: records.length > 0,
+    disabled: disabled.length > 0,
+    frameDisabled: records.some((item) => item.frame_disabled),
+    disabledWindows: disabled.length,
+    totalWindows: records.length,
+    triggerFrames: Array.from(triggerFrames).sort((a, b) => a - b),
+    reasonCounts,
+  };
+}
+
+function reliabilitySummary(stats, loading = false) {
+  if (loading) return "loading";
+  if (!stats || !stats.has) return "unknown";
+  if (!stats.disabled) return "enabled";
+  const reasons = Object.keys(stats.reasonCounts);
+  const reason = reasons.length ? reasons.join(", ") : "disabled";
+  const frames = stats.triggerFrames.slice(0, 3).join(", ");
+  const suffix = frames ? ` / trigger ${frames}` : "";
+  return `DISABLED / ${reason}${suffix}`;
+}
+
+function drawDisabledOverlay(stats) {
+  if (!stats || !stats.disabled) return;
+  const rect = sourceCanvas.getBoundingClientRect();
+  const width = Math.min(rect.width - 28, 620);
+  sourceCtx.save();
+  sourceCtx.fillStyle = "rgba(185, 28, 28, 0.82)";
+  sourceCtx.fillRect(14, 14, width, 72);
+  sourceCtx.strokeStyle = "rgba(255, 255, 255, 0.72)";
+  sourceCtx.lineWidth = 1.5;
+  sourceCtx.strokeRect(14.75, 14.75, width - 1.5, 70.5);
+  sourceCtx.fillStyle = "#ffffff";
+  sourceCtx.font = "700 18px system-ui, sans-serif";
+  sourceCtx.fillText("DISABLED 40-FRAME SEGMENT", 30, 41);
+  sourceCtx.font = "500 13px system-ui, sans-serif";
+  const reason = Object.keys(stats.reasonCounts).join(", ") || "reliability rule";
+  const triggers = stats.triggerFrames.slice(0, 3).join(", ");
+  sourceCtx.fillText(triggers ? `${reason} / trigger ${triggers}` : reason, 30, 66);
+  sourceCtx.restore();
+}
+
 function drawPathOverlay(trackSets, fit) {
   const left = [];
   const right = [];
@@ -1514,6 +1958,7 @@ function drawMain() {
     .map((summary) => windowCache.get(summary.id))
     .filter(Boolean)
     .map((win) => ({ win, tracks: frameTracks(win, frameIndex) }));
+  const reliabilityStats = collectReliability(trackSets);
   let pathStats = { mode: "off", points: 0 };
   if (fit && showMask.checked) {
     const savedMaskDrawn = trackSets.some(({ win }) => drawMask(win, fit));
@@ -1527,19 +1972,24 @@ function drawMain() {
         const crumb = win._crumbMap.get(point[0]);
         if (!crumb) return;
         const [cx, cy] = imageToCanvas([point[1], point[2]], fit);
+        const confidence = pointConfidence(point);
         const selected = selectedPoint && selectedPoint.windowId === win.id && selectedPoint.pointId === point[0];
+        sourceCtx.save();
+        sourceCtx.globalAlpha = selected ? 1 : pointAlpha(confidence);
         sourceCtx.fillStyle = selected ? "#ef4444" : pointColor(crumb);
         sourceCtx.strokeStyle = "rgba(0,0,0,0.55)";
         sourceCtx.lineWidth = selected ? 2.5 : 1.5;
         sourceCtx.beginPath();
-        sourceCtx.arc(cx, cy, selected ? 6 : 4, 0, Math.PI * 2);
+        sourceCtx.arc(cx, cy, pointRadius(confidence, selected), 0, Math.PI * 2);
         sourceCtx.fill();
         sourceCtx.stroke();
-        drawPoints.push({ cx, cy, pointId: point[0], x: point[1], y: point[2], crumb, window: win });
+        sourceCtx.restore();
+        drawPoints.push({ cx, cy, pointId: point[0], x: point[1], y: point[2], confidence, crumb, window: win });
       });
     });
   }
-  updateText(summaries, trackSets, false, pathStats);
+  if (fit) drawDisabledOverlay(reliabilityStats);
+  updateText(summaries, trackSets, false, pathStats, reliabilityStats);
   preloadNearbyWindows(summaries);
 }
 
@@ -1576,7 +2026,13 @@ function drawSelectedSource() {
   pointCtx.stroke();
 }
 
-function updateText(summaries, trackSets, loading, pathStats = { mode: "none", points: 0 }) {
+function updateText(
+  summaries,
+  trackSets,
+  loading,
+  pathStats = { mode: "none", points: 0 },
+  reliabilityStats = collectReliability(trackSets)
+) {
   const frame = data.frames[frameIndex];
   frameText.textContent = `${frameIndex} / ${data.frames.length - 1}`;
   timeText.textContent = `${Number(frame.rel_time_sec || 0).toFixed(2)} s`;
@@ -1613,6 +2069,8 @@ function updateText(summaries, trackSets, loading, pathStats = { mode: "none", p
   }
   const pointCount = trackSets.reduce((total, item) => total + (item.tracks ? item.tracks.points.length : 0), 0);
   pointsText.textContent = loading ? "loading" : pointCount;
+  confidenceText.textContent = confidenceSummary(trackSets, loading);
+  reliabilityText.textContent = reliabilitySummary(reliabilityStats, loading);
   frameSlider.value = frameIndex;
   frameInput.value = frameIndex;
   windowSelect.value = selectedWindowId || "";
@@ -1678,6 +2136,7 @@ sourceCanvas.addEventListener("click", (event) => {
   selectedText.textContent =
     `Window ${best.window.id}, point ${best.pointId}. ` +
     `Current frame ${frameIndex}, query source frame ${best.crumb.source_frame}, ` +
+    `confidence ${formatConfidence(best.confidence)}, ` +
     `source ${best.crumb.source || "avt"}, side ${best.crumb.side < 0 ? "left" : "right"}.`;
   drawMain();
   drawSelectedSource();
@@ -1697,6 +2156,25 @@ windowSelect.addEventListener("change", () => {
   selectedWindowId = windowSelect.value;
   drawMain();
 });
+
+function updateReliabilitySettingsFromControls() {
+  reliabilitySettings = readReliabilitySettingsFromControls();
+  applyReliabilitySettingsToControls(reliabilitySettings);
+  saveReliabilitySettings(reliabilitySettings);
+  if (data) drawMain();
+}
+
+reliabilitySettings = loadStoredReliabilitySettings();
+applyReliabilitySettingsToControls(reliabilitySettings);
+[
+  reliabilitySpanInput,
+  reliabilityBlockInput,
+  reliabilityPointsInput,
+  reliabilitySegmentInput,
+].forEach((input) => {
+  input.addEventListener("change", updateReliabilitySettingsFromControls);
+});
+
 jumpPointBtn.addEventListener("click", () => {
   if (!selectedPoint) return;
   pause();

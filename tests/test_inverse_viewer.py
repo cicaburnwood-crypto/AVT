@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import cv2
@@ -23,6 +24,15 @@ from avt.querying import (
     query_config_from_mapping,
     robot_sift_mask,
 )
+from avt.reliability import (
+    STATIONARY_BLOCK_SIZE_PX,
+    STATIONARY_SPAN_FRAMES,
+    STOP_EXTREME_SLOW_REASON,
+    detect_stationary_sift_frames,
+    frame_reliability,
+    segment_bounds,
+    unreliable_segments,
+)
 from avt.schema import QueryPoint, TrackerInfo, WindowSpec
 from avt.tracking.base import TrackingBundle
 from avt.tracking.bootstap.backend import _query_points_for_resize, _tapnet_outputs_to_avt
@@ -36,12 +46,15 @@ class FakeTracker:
     def track(self, frames_rgb: np.ndarray, queries: list[QueryPoint]) -> TrackingBundle:
         tracks = np.full((len(frames_rgb), len(queries), 2), np.nan, dtype=np.float32)
         visibility = np.zeros((len(frames_rgb), len(queries)), dtype=bool)
+        confidence = np.zeros((len(frames_rgb), len(queries)), dtype=np.float32)
         for query in queries:
             tracks[query.reverse_time :, query.id] = [query.x, query.y]
             visibility[query.reverse_time :, query.id] = True
+            confidence[query.reverse_time :, query.id] = 0.25 + query.id * 0.01
         return TrackingBundle(
             tracks=tracks,
             visibility=visibility,
+            confidence=confidence,
             tracker=TrackerInfo(name="fake"),
         )
 
@@ -387,12 +400,79 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
     assert (output_root / "windows" / "seq_0_4" / "window.json").exists()
     assert not (output_root / "windows" / "seq_0_4" / "reverse_video.mp4").exists()
     assert not (output_root / "windows" / "seq_0_4" / "path_mask_reference.png").exists()
+    arrays = np.load(output_root / "windows" / "seq_0_4" / "tracks.npz")
+    assert arrays["confidence_reverse"].shape == arrays["visibility_reverse"].shape
+    assert arrays["confidence_reverse"].dtype == np.float32
 
     viewer_dir = tmp_path / "viewer"
     payload = build_viewer(frames_root, records, output_root, viewer_dir)
     assert payload["metadata"]["successful_windows"] == 1
+    assert payload["metadata"]["reliability_filter"]["schema"] == "avt_frame_segment_reliability_v1"
+    assert payload["metadata"]["reliability_filter"]["segment_size_frames"] == 40
+    assert payload["metadata"]["reliability_filter"]["rules"][0]["span_frames"] == 10
+    assert payload["metadata"]["reliability_filter"]["rules"][0]["block_size_px"] == 6.0
     assert (viewer_dir / "index.html").exists()
     assert (viewer_dir / "data" / "prediction_tracks.json").exists()
+    segment = json.loads((viewer_dir / "data" / "windows" / "seq_0_4.json").read_text())
+    assert segment["point_columns"] == ["id", "x", "y", "confidence"]
+    assert len(segment["frames"][0]["points"][0]) == 4
+    assert 0.0 <= segment["frames"][0]["points"][0][3] <= 1.0
+    assert segment["frames"][0]["reliability"]["segment_id"] == 0
+    assert segment["frames"][0]["reliability"]["segment_unreliable"] is False
+    assert segment["frames"][0]["reliability"]["segment_disabled"] is False
+    assert segment["frames"][0]["reliability"]["unreliable_point_ids"] == []
+
+
+def test_reliability_marks_40_frame_segment() -> None:
+    assert segment_bounds(41) == (40, 80)
+    assert unreliable_segments([41]) == {1}
+
+    before = frame_reliability(39, [], unreliable_frame_indices=[41])
+    triggered = frame_reliability(41, [], unreliable_frame_indices=[41], frame_reasons={41: ["test"]})
+    same_segment = frame_reliability(79, [], unreliable_frame_indices=[41])
+    next_segment = frame_reliability(80, [], unreliable_frame_indices=[41])
+
+    assert before["segment_unreliable"] is False
+    assert triggered["frame_unreliable"] is True
+    assert triggered["segment_unreliable"] is True
+    assert triggered["segment_disabled"] is True
+    assert triggered["segment_status"] == "disabled"
+    assert triggered["trigger_frame_indices"] == [41]
+    assert triggered["reason_counts"] == {"test": 1}
+    assert same_segment["segment_unreliable"] is True
+    assert same_segment["frame_unreliable"] is False
+    assert next_segment["segment_unreliable"] is False
+
+
+def test_stationary_sift_points_disable_segment() -> None:
+    tracks = np.zeros((12, 4, 2), dtype=np.float32)
+    visibility = np.ones((12, 4), dtype=bool)
+    for reverse_t in range(12):
+        tracks[reverse_t, :, 0] = 100 + reverse_t * 30 + np.arange(4)
+        tracks[reverse_t, :, 1] = 200 + reverse_t * 30 + np.arange(4)
+
+    for reverse_t in range(2, 12):
+        offset = (reverse_t - 2) * 0.5
+        tracks[reverse_t, :3] = [
+            [10 + offset, 10],
+            [20, 20 + offset],
+            [15 + offset, 15 + offset],
+        ]
+
+    reasons = detect_stationary_sift_frames(
+        tracks,
+        visibility,
+        seq_start=0,
+        seq_end=12,
+        sift_point_ids=[0, 1, 2],
+    )
+    assert STATIONARY_SPAN_FRAMES == 10
+    assert STATIONARY_BLOCK_SIZE_PX == 6.0
+    assert reasons == {9: [STOP_EXTREME_SLOW_REASON]}
+
+    marked = frame_reliability(0, [], unreliable_frame_indices=reasons.keys(), frame_reasons=reasons)
+    assert marked["segment_disabled"] is True
+    assert marked["reason_counts"] == {STOP_EXTREME_SLOW_REASON: 1}
 
 
 def test_reference_mask_uses_support_points() -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
@@ -15,6 +15,8 @@ class TrackingBundle:
     tracks: np.ndarray
     visibility: np.ndarray
     tracker: TrackerInfo
+    confidence: np.ndarray | None = None
+    confidence_components: dict[str, np.ndarray] = field(default_factory=dict)
 
     def validate(self, frame_count: int, query_count: int) -> None:
         if self.tracks.shape != (frame_count, query_count, 2):
@@ -27,6 +29,17 @@ class TrackingBundle:
                 f"visibility shape {self.visibility.shape} does not match "
                 f"({frame_count}, {query_count})"
             )
+        if self.confidence is not None and self.confidence.shape != (frame_count, query_count):
+            raise ValueError(
+                f"confidence shape {self.confidence.shape} does not match "
+                f"({frame_count}, {query_count})"
+            )
+        for name, component in self.confidence_components.items():
+            if component.shape != (frame_count, query_count):
+                raise ValueError(
+                    f"confidence component {name!r} shape {component.shape} does not match "
+                    f"({frame_count}, {query_count})"
+                )
 
 
 class PointTracker(Protocol):
