@@ -14,6 +14,7 @@ from .viewer import build_viewer
 
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs"
 DEFAULT_VIEWER_ROOT = DEFAULT_OUTPUT_ROOT / "viewer_runs"
+DEFAULT_CACHE_ROOT = DEFAULT_OUTPUT_ROOT / "cotracker_caches"
 
 
 def _create_unique_run_dir(base: Path, preferred_name: str | None = None) -> Path:
@@ -127,6 +128,7 @@ def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
         path_support_enabled=args.path_support,
         path_support_min_points=args.path_support_min_points,
         path_support_fraction=args.path_support_fraction,
+        cache_record_ids_only=bool(getattr(args, "cache_record_ids_only", False)),
     )
 
 
@@ -142,6 +144,16 @@ def _tracker_from_args(args: argparse.Namespace):
             torch_home=args.torch_home,
             hub_repo=args.cotracker_hub_repo,
             hub_model=args.cotracker_hub_model,
+            visibility_threshold=args.cotracker_visibility_threshold,
+        )
+    if args.backend == "cotracker_cache":
+        if args.cotracker_cache is None:
+            raise ValueError("--cotracker-cache is required for --backend cotracker_cache")
+        from .tracking.cotracker_cache import CachedCoTrackerBackend
+
+        return CachedCoTrackerBackend(
+            cache_path=args.cotracker_cache,
+            max_match_distance=args.cache_match_distance,
         )
     if args.backend == "foundationpose":
         from .tracking.foundationpose import FoundationPoseBackend
@@ -180,6 +192,48 @@ def _tracker_from_args(args: argparse.Namespace):
         )
         return BootstapBackend(**config.__dict__)
     raise ValueError(f"Unknown backend: {args.backend}")
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    from .tracking.cotracker_cache import CoTrackerCacheConfig, build_cotracker_cache
+
+    records = read_frame_records(args.frames_root, args.source_type)
+    output_root = _create_unique_run_dir(args.output_root)
+    metadata = build_cotracker_cache(
+        source_root=args.frames_root,
+        frame_records=records,
+        output_dir=output_root,
+        config=CoTrackerCacheConfig(
+            frame_start=args.cache_frame_start,
+            frame_count=args.cache_frame_count,
+            grid_stride=args.cache_grid_stride,
+            region=args.cache_region,
+            query_mode=args.cache_query_mode,
+            query_frame_stride=args.cache_query_frame_stride,
+            max_query_points=args.cache_max_query_points,
+            device=args.cotracker_device,
+            batch_size=args.cotracker_batch_size,
+            torch_home=args.torch_home,
+            hub_repo=args.cotracker_hub_repo,
+            hub_model=args.cotracker_hub_model,
+            visibility_threshold=args.cotracker_visibility_threshold,
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                "cache_base": str(args.output_root),
+                "cache_root": str(output_root),
+                "metadata": str(output_root / "metadata.json"),
+                "frames": metadata["frame_count"],
+                "points": metadata["point_count"],
+                "region": metadata["config"]["region"],
+                "query_mode": metadata["config"]["query_mode"],
+            },
+            indent=2,
+        )
+    )
+    return 0
 
 
 def cmd_track(args: argparse.Namespace) -> int:
@@ -297,17 +351,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def add_tracker_args(cmd: argparse.ArgumentParser) -> None:
-        cmd.add_argument(
-            "--backend",
-            choices=("lk", "cotracker", "foundationpose", "bootstap"),
-            default="lk",
-        )
+    def add_cotracker_args(cmd: argparse.ArgumentParser) -> None:
         cmd.add_argument("--cotracker-device", default="auto")
         cmd.add_argument("--cotracker-batch-size", type=int, default=256)
         cmd.add_argument("--cotracker-hub-repo", default="facebookresearch/co-tracker")
         cmd.add_argument("--cotracker-hub-model", default="cotracker3_offline")
+        cmd.add_argument("--cotracker-visibility-threshold", type=float, default=0.9)
         cmd.add_argument("--torch-home", default=None)
+
+    def add_cache_backend_args(cmd: argparse.ArgumentParser) -> None:
+        cmd.add_argument(
+            "--cotracker-cache",
+            type=Path,
+            default=None,
+            help="Reusable CoTracker cache directory or metadata.json for cotracker_cache backend.",
+        )
+        cmd.add_argument("--cache-match-distance", type=float, default=12.0)
+        cmd.add_argument(
+            "--cache-record-ids-only",
+            action="store_true",
+            help="For cotracker_cache, write cache point IDs/frame references instead of full tracks.",
+        )
+
+    def add_tracker_args(cmd: argparse.ArgumentParser) -> None:
+        cmd.add_argument(
+            "--backend",
+            choices=("lk", "cotracker", "cotracker_cache", "foundationpose", "bootstap"),
+            default="lk",
+        )
+        add_cotracker_args(cmd)
+        add_cache_backend_args(cmd)
         cmd.add_argument("--foundationpose-device", default="auto")
         cmd.add_argument(
             "--foundationpose-weights-dir",
@@ -360,6 +433,38 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Use strict checkpoint loading for the BootsTAPIR model.",
         )
+
+    cache = sub.add_parser("cache", help="Precompute a reusable CoTracker all-points cache.")
+    _add_source_args(cache)
+    cache.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_CACHE_ROOT,
+        help=f"Base directory for unique CoTracker caches. Default: {DEFAULT_CACHE_ROOT}",
+    )
+    cache.add_argument("--cache-frame-start", type=int, default=0)
+    cache.add_argument("--cache-frame-count", type=int, default=None)
+    cache.add_argument("--cache-grid-stride", type=int, default=8)
+    cache.add_argument(
+        "--cache-region",
+        choices=("full", "bottom-third", "bottom-half"),
+        default="full",
+    )
+    cache.add_argument(
+        "--cache-query-mode",
+        choices=("last-frame", "every-frame"),
+        default="last-frame",
+        help="Seed grid points once at reverse frame 0 or at every reverse frame.",
+    )
+    cache.add_argument("--cache-query-frame-stride", type=int, default=1)
+    cache.add_argument(
+        "--cache-max-query-points",
+        type=int,
+        default=0,
+        help="Optional cap for smoke tests. 0 means no cap.",
+    )
+    add_cotracker_args(cache)
+    cache.set_defaults(func=cmd_cache)
 
     track = sub.add_parser("track", help="Run inverse-video point tracking.")
     _add_source_args(track)

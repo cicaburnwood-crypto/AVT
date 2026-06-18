@@ -37,6 +37,7 @@ from avt.schema import QueryPoint, TrackerInfo, WindowSpec
 from avt.tracking.base import TrackingBundle
 from avt.tracking.bootstap.backend import _query_points_for_resize, _tapnet_outputs_to_avt
 from avt.tracking.bootstap.config import bootstap_config_from_mapping
+from avt.tracking.cotracker_cache import CachedCoTrackerBackend, CACHE_SCHEMA
 from avt.tracking.foundationpose import FoundationPoseBackend
 from avt.tracking.foundationpose.download import FOUNDATIONPOSE_WEIGHT_FILES
 from avt.viewer import build_viewer
@@ -268,6 +269,43 @@ def test_cli_accepts_bootstap_backend() -> None:
     assert args.bootstap_resize_width == 320
 
 
+def test_cli_accepts_cotracker_cache_backend() -> None:
+    parser = build_parser()
+
+    cache_args = parser.parse_args(
+        [
+            "cache",
+            "--frames-root",
+            "/tmp/frames",
+            "--cache-frame-count",
+            "100",
+            "--cache-grid-stride",
+            "16",
+            "--cache-query-mode",
+            "every-frame",
+        ]
+    )
+    track_args = parser.parse_args(
+        [
+            "track",
+            "--frames-root",
+            "/tmp/frames",
+            "--backend",
+            "cotracker_cache",
+            "--cotracker-cache",
+            "/tmp/cache",
+            "--cache-record-ids-only",
+        ]
+    )
+
+    assert cache_args.cache_frame_count == 100
+    assert cache_args.cache_grid_stride == 16
+    assert cache_args.cache_query_mode == "every-frame"
+    assert track_args.backend == "cotracker_cache"
+    assert track_args.cotracker_cache == Path("/tmp/cache")
+    assert track_args.cache_record_ids_only is True
+
+
 def test_bootstap_config_from_mapping() -> None:
     config = bootstap_config_from_mapping(
         {
@@ -355,6 +393,112 @@ def test_foundationpose_homography_adapter(tmp_path: Path) -> None:
     assert bundle.tracks[:, 0, 0].tolist() == [5, 7, 9, 11]
     assert np.isnan(bundle.tracks[:2, 1]).all()
     assert bundle.tracks[2:, 1, 0].tolist() == [10, 12]
+
+
+def write_synthetic_cotracker_cache(root: Path, frame_count: int = 6) -> Path:
+    root.mkdir()
+    point_ids = np.array([0, 1, 2], dtype=np.int64)
+    birth_reverse_times = np.array([0, 0, 2], dtype=np.int32)
+    source_birth_frames = np.array([5, 5, 3], dtype=np.int32)
+    seed_xy = np.array([[10, 10], [30, 20], [50, 30]], dtype=np.float32)
+    tracks = np.zeros((frame_count, len(point_ids), 2), dtype=np.float32)
+    visibility = np.ones((frame_count, len(point_ids)), dtype=bool)
+    confidence = np.ones((frame_count, len(point_ids)), dtype=np.float32) * 0.75
+    for t in range(frame_count):
+        tracks[t, :, 0] = seed_xy[:, 0] + t
+        tracks[t, :, 1] = seed_xy[:, 1] + t * 2
+    visibility[:2, 2] = False
+    tracks[:2, 2] = np.nan
+    confidence[:2, 2] = 0
+
+    np.save(root / "tracks_reverse.npy", tracks)
+    np.save(root / "visibility_reverse.npy", visibility)
+    np.save(root / "confidence_reverse.npy", confidence)
+    np.save(root / "point_ids.npy", point_ids)
+    np.save(root / "birth_reverse_times.npy", birth_reverse_times)
+    np.save(root / "source_birth_frames.npy", source_birth_frames)
+    np.save(root / "seed_xy.npy", seed_xy)
+    metadata = {
+        "schema": CACHE_SCHEMA,
+        "source_root": "/tmp/source",
+        "frame_start": 0,
+        "frame_end": frame_count,
+        "frame_count": frame_count,
+        "width": 64,
+        "height": 48,
+        "point_count": len(point_ids),
+        "config": {"grid_stride": 16, "region": "full", "query_mode": "last-frame"},
+        "tracker": {"name": "cotracker"},
+        "arrays": {
+            "tracks": "tracks_reverse.npy",
+            "visibility": "visibility_reverse.npy",
+            "confidence": "confidence_reverse.npy",
+            "point_ids": "point_ids.npy",
+            "birth_reverse_times": "birth_reverse_times.npy",
+            "source_birth_frames": "source_birth_frames.npy",
+            "seed_xy": "seed_xy.npy",
+        },
+    }
+    (root / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
+    return root
+
+
+def test_cached_cotracker_backend_slices_cache(tmp_path: Path) -> None:
+    cache_root = write_synthetic_cotracker_cache(tmp_path / "cache")
+    tracker = CachedCoTrackerBackend(cache_root, max_match_distance=5)
+    tracker.set_window_context(WindowSpec(start=1, end=5), tmp_path)
+    frames = np.zeros((4, 48, 64, 3), dtype=np.uint8)
+    queries = [
+        QueryPoint(id=0, reverse_time=0, x=11, y=12, side=-1),
+        QueryPoint(id=1, reverse_time=2, x=13, y=16, side=1),
+        QueryPoint(id=2, reverse_time=0, x=63, y=47, side=0),
+    ]
+
+    bundle = tracker.track(frames, queries)
+
+    assert bundle.tracker.name == "cotracker_cache"
+    assert bundle.extra_arrays["cache_point_ids"].tolist() == [0, 0, -1]
+    assert bundle.extra_arrays["cache_query_source_frames"].tolist() == [4, 2, 4]
+    assert bundle.visibility[:, 0].tolist() == [True, True, True, True]
+    assert bundle.visibility[:2, 1].tolist() == [False, False]
+    assert bundle.visibility[2:, 1].tolist() == [True, True]
+    assert not bundle.visibility[:, 2].any()
+    assert bundle.confidence is not None
+    assert bundle.confidence.shape == (4, 3)
+
+
+def test_cache_record_ids_only_artifacts(tmp_path: Path) -> None:
+    frames = np.zeros((4, 48, 64, 3), dtype=np.uint8)
+    queries = [QueryPoint(id=0, reverse_time=0, x=10, y=10, side=0)]
+    bundle = TrackingBundle(
+        tracks=np.zeros((4, 1, 2), dtype=np.float32),
+        visibility=np.ones((4, 1), dtype=bool),
+        tracker=TrackerInfo(name="cotracker_cache"),
+        extra_arrays={
+            "cache_point_ids": np.array([7], dtype=np.int64),
+            "cache_query_source_frames": np.array([3], dtype=np.int32),
+        },
+        extra_metadata={
+            "cache_reference": {
+                "schema": CACHE_SCHEMA,
+                "path": "/tmp/cache",
+                "matched_queries": 1,
+                "query_count": 1,
+            }
+        },
+    )
+    config = InverseTrackConfig(cache_record_ids_only=True)
+    from avt.inverse import write_window_artifacts
+
+    write_window_artifacts(tmp_path, WindowSpec(0, 4), frames, queries, bundle, config)
+    arrays = np.load(tmp_path / "windows" / "seq_0_4" / "tracks.npz")
+    metadata = json.loads((tmp_path / "windows" / "seq_0_4" / "window.json").read_text())
+
+    assert "tracks_reverse" not in arrays
+    assert arrays["cache_point_ids"].tolist() == [7]
+    assert arrays["cache_query_source_frames"].tolist() == [3]
+    assert metadata["artifact_mode"] == "cache_ids_only"
+    assert metadata["cache_reference"]["matched_queries"] == 1
 
 
 def test_foundationpose_transform_directory_uses_window_context(tmp_path: Path) -> None:

@@ -59,6 +59,85 @@ def _copy_mask(window_dir: Path, viewer_dir: Path, window_id: str) -> str | None
     return f"data/masks/{dst.name}"
 
 
+def _window_tracks_from_cache(
+    window_dir: Path,
+    meta: dict[str, Any],
+    arrays: np.lib.npyio.NpzFile,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    cache_reference = meta.get("cache_reference") or {}
+    cache_path_value = cache_reference.get("path") or cache_reference.get("metadata")
+    if not cache_path_value:
+        raise KeyError("ID-only window artifact is missing cache_reference.path")
+
+    from .tracking.cotracker_cache import CoTrackerCache
+
+    cache_path = Path(cache_path_value)
+    if not cache_path.exists() and not cache_path.is_absolute():
+        cache_path = (window_dir / cache_path).resolve()
+    cache = CoTrackerCache(cache_path)
+    seq_start = int(meta["seq_start"])
+    seq_end = int(meta["seq_end"])
+    t_len = seq_end - seq_start
+    cache_indices = np.arange(
+        cache.reverse_index_for_source_frame(seq_end - 1),
+        cache.reverse_index_for_source_frame(seq_end - 1) + t_len,
+        dtype=np.int64,
+    )
+    point_ids = arrays["cache_point_ids"].astype(np.int64)
+    tracks = np.full((t_len, len(point_ids), 2), np.nan, dtype=np.float32)
+    visibility = np.zeros((t_len, len(point_ids)), dtype=bool)
+    confidence = (
+        np.zeros((t_len, len(point_ids)), dtype=np.float32)
+        if cache.confidence is not None
+        else None
+    )
+    valid = np.flatnonzero(point_ids >= 0)
+    if valid.size:
+        cache_point_ids = point_ids[valid]
+        tracks[:, valid] = np.asarray(
+            cache.tracks[np.ix_(cache_indices, cache_point_ids)],
+            dtype=np.float32,
+        )
+        visibility[:, valid] = np.asarray(
+            cache.visibility[np.ix_(cache_indices, cache_point_ids)],
+            dtype=bool,
+        )
+        if confidence is not None and cache.confidence is not None:
+            confidence[:, valid] = np.asarray(
+                cache.confidence[np.ix_(cache_indices, cache_point_ids)],
+                dtype=np.float32,
+            )
+
+    if "queries" in arrays:
+        for query_index, row in enumerate(arrays["queries"]):
+            reverse_time = max(0, min(t_len, int(round(float(row[1])))))
+            if reverse_time > 0:
+                visibility[:reverse_time, query_index] = False
+                tracks[:reverse_time, query_index] = np.nan
+                if confidence is not None:
+                    confidence[:reverse_time, query_index] = 0.0
+    return tracks, visibility, confidence
+
+
+def _window_tracks(
+    window_dir: Path,
+    meta: dict[str, Any],
+    arrays: np.lib.npyio.NpzFile,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    if "tracks_reverse" in arrays:
+        tracks = arrays["tracks_reverse"]
+        visibility = arrays["visibility_reverse"].astype(bool)
+        confidence = arrays["confidence_reverse"].astype(np.float32) if "confidence_reverse" in arrays else None
+        if confidence is not None and confidence.shape != visibility.shape:
+            raise ValueError(
+                f"confidence_reverse shape {confidence.shape} does not match visibility shape {visibility.shape}"
+            )
+        return tracks, visibility, confidence
+    if "cache_point_ids" in arrays:
+        return _window_tracks_from_cache(window_dir, meta, arrays)
+    raise KeyError("Window tracks.npz must contain tracks_reverse or cache_point_ids")
+
+
 def _window_payload(
     window_dir: Path,
     viewer_dir: Path,
@@ -69,11 +148,7 @@ def _window_payload(
 ) -> dict[str, Any]:
     meta = json.loads((window_dir / "window.json").read_text(encoding="utf-8"))
     arrays = np.load(window_dir / meta["files"]["tracks"])
-    tracks = arrays["tracks_reverse"]
-    visibility = arrays["visibility_reverse"].astype(bool)
-    confidence = arrays["confidence_reverse"].astype(np.float32) if "confidence_reverse" in arrays else None
-    if confidence is not None and confidence.shape != visibility.shape:
-        raise ValueError(f"confidence_reverse shape {confidence.shape} does not match visibility shape {visibility.shape}")
+    tracks, visibility, confidence = _window_tracks(window_dir, meta, arrays)
     queries = arrays["queries"]
     query_records = _query_records(arrays)
 

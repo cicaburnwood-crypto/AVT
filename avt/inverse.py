@@ -39,6 +39,7 @@ class InverseTrackConfig:
     path_support_enabled: bool = True
     path_support_min_points: int = 32
     path_support_fraction: int = 6
+    cache_record_ids_only: bool = False
 
 
 def _avt_seed_ratios(config: InverseTrackConfig, width: int, height: int) -> tuple[float, float, float]:
@@ -216,14 +217,20 @@ def write_window_artifacts(
     h, w = frames_rgb.shape[1:3]
 
     query_arrays = query_artifact_arrays(queries)
-    track_arrays = {
-        "tracks_reverse": bundle.tracks.astype(np.float32),
-        "visibility_reverse": bundle.visibility.astype(bool),
-    }
-    if bundle.confidence is not None:
-        track_arrays["confidence_reverse"] = bundle.confidence.astype(np.float32)
-    for name, component in bundle.confidence_components.items():
-        track_arrays[f"{name}_reverse"] = component.astype(np.float32)
+    if config.cache_record_ids_only and "cache_point_ids" not in bundle.extra_arrays:
+        raise ValueError("--cache-record-ids-only requires a cache-backed tracker")
+    track_arrays = {}
+    if not config.cache_record_ids_only:
+        track_arrays = {
+            "tracks_reverse": bundle.tracks.astype(np.float32),
+            "visibility_reverse": bundle.visibility.astype(bool),
+        }
+        if bundle.confidence is not None:
+            track_arrays["confidence_reverse"] = bundle.confidence.astype(np.float32)
+        for name, component in bundle.confidence_components.items():
+            track_arrays[f"{name}_reverse"] = component.astype(np.float32)
+    for name, array in bundle.extra_arrays.items():
+        track_arrays[name] = np.asarray(array)
     np.savez_compressed(
         window_dir / "tracks.npz",
         **track_arrays,
@@ -260,6 +267,8 @@ def write_window_artifacts(
         },
         "tracker": bundle.tracker.to_json(),
         "config": asdict(config),
+        "artifact_mode": "cache_ids_only" if config.cache_record_ids_only else "tracks",
+        "cache_reference": bundle.extra_metadata.get("cache_reference"),
         "path_support": {
             "enabled": bool(config.path_support_enabled),
             "point_count": int(len(support_points)),
@@ -274,6 +283,7 @@ def write_window_artifacts(
         },
         "files": {
             "tracks": "tracks.npz",
+            "tracks_reverse": None if config.cache_record_ids_only else "tracks.npz",
             "mask": "path_mask_reference.png" if config.save_path_mask else None,
             "reverse_video": "reverse_video.mp4" if config.save_reverse_video else None,
         },

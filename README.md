@@ -61,6 +61,77 @@ avt all \
   --max-windows 1
 ```
 
+## CoTracker Cache Backend
+
+For dense or repeatedly tuned workflows, precompute CoTracker once and reuse the
+saved point IDs in later AVT extraction runs. This avoids re-running CoTracker
+for every overlapping window when you only change SIFT, anchor, mask, or window
+parameters.
+
+```bash
+avt cache \
+  --frames-root /path/to/images \
+  --source-type image_dir \
+  --cache-frame-start 0 \
+  --cache-frame-count 100 \
+  --cache-grid-stride 8 \
+  --cache-region full \
+  --cache-query-mode last-frame \
+  --cotracker-device cuda \
+  --cotracker-batch-size 1024
+```
+
+The command writes a reusable cache directory under `outputs/cotracker_caches`
+with memory-mappable `.npy` arrays and `metadata.json`. Time is stored in global
+reverse-video order: cache time 0 is the last frame in the cached range.
+
+Then extract AVT windows from the cache:
+
+```bash
+avt all \
+  --frames-root /path/to/images \
+  --source-type image_dir \
+  --backend cotracker_cache \
+  --cotracker-cache outputs/cotracker_caches/run_YYYYMMDD_HHMMSS_xxxxxx \
+  --cache-match-distance 12 \
+  --query-mode ventura \
+  --robot-config configs/virtual_robot.yaml \
+  --window-size 80 \
+  --window-step 1 \
+  --save-path-mask
+```
+
+By default this cached backend still writes regular `tracks_reverse` arrays for
+compatibility. Add `--cache-record-ids-only` to write compact per-window
+references instead:
+
+```bash
+avt all \
+  --frames-root /path/to/images \
+  --source-type image_dir \
+  --backend cotracker_cache \
+  --cotracker-cache /path/to/cache \
+  --cache-record-ids-only \
+  --query-mode ventura \
+  --robot-config configs/virtual_robot.yaml \
+  --window-size 80 \
+  --window-step 1 \
+  --save-path-mask
+```
+
+In ID-only mode `tracks.npz` stores arrays such as `cache_point_ids`,
+`cache_query_source_frames`, `cache_birth_source_frames`, and
+`cache_match_distances` instead of duplicating full tracks per window. The
+viewer can materialize those tracks from the referenced cache later.
+
+Cache query modes:
+
+- `last-frame`: seed the grid once on reverse frame 0, matching the "track from
+  the last frame backward" flow.
+- `every-frame`: seed the grid repeatedly through reverse time. This records
+  possible replacement IDs for later frames without changing extractor
+  parameters, at the cost of a larger cache.
+
 ## BootsTAPIR Backend
 
 BootsTAPIR is available as a separate selectable backend, parallel to
@@ -265,6 +336,11 @@ Optional debug outputs are opt-in:
   VENTURA robot-footprint SIFT crumbs, and `2` is full-frame SIFT anchors.
 - `query_records_json`: rich per-query metadata, including source and SIFT
   keypoint fields when available.
+
+When `--cache-record-ids-only` is used with `--backend cotracker_cache`,
+`tracks.npz` omits `tracks_reverse` and `visibility_reverse` and instead stores
+cache ID/frame reference arrays. `window.json` records `artifact_mode:
+cache_ids_only` and the cache path needed to materialize tracks.
 
 `window.json` also stores `query_capture.image_alignment`, including the input
 window resolution, pixel footprint bounds, normalized seed ratios, and the
