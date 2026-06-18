@@ -139,7 +139,11 @@ class CoTrackerBackend:
     def _track_batch(self, model, video, batch, torch) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
         try:
             raw = self._track_batch_with_raw_confidence(model, video, batch, torch)
-        except Exception:
+        except Exception as exc:
+            if exc.__class__.__name__ == "OutOfMemoryError" or "CUDA out of memory" in str(exc):
+                if hasattr(torch, "cuda"):
+                    torch.cuda.empty_cache()
+                raise
             raw = None
         if raw is not None:
             return raw
@@ -165,6 +169,7 @@ class CoTrackerBackend:
         device = "cuda" if self.device == "auto" and torch.cuda.is_available() else self.device
         if device == "auto":
             device = "cpu"
+        is_cuda_device = str(device).startswith("cuda")
 
         video = torch.from_numpy(frames_rgb).permute(0, 3, 1, 2)[None].float().to(device)
         query_rows = [[q.reverse_time, q.x, q.y] for q in queries]
@@ -201,6 +206,9 @@ class CoTrackerBackend:
                 confidence_batches.append(batch_confidence)
                 for name, component in batch_components.items():
                     confidence_component_batches.setdefault(name, []).append(component)
+                if is_cuda_device:
+                    del batch, batch_tracks, batch_visibility, batch_confidence, batch_components
+                    torch.cuda.empty_cache()
 
         tracks = np.concatenate(track_batches, axis=1).astype(np.float32)
         visibility = np.concatenate(visibility_batches, axis=1).astype(bool)
