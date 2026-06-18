@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import importlib
+import importlib.machinery
+import importlib.util
 from pathlib import Path
+import sys
+import types
 
 import cv2
 import numpy as np
@@ -36,7 +41,7 @@ class BootstapBackend:
         try:
             import torch
             import torch.nn.functional as F
-            from tapnet.torch import tapir_model
+            tapir_model = _import_tapir_model()
         except ImportError as exc:  # pragma: no cover - optional dependency
             raise RuntimeError(
                 "BootsTAPIR backend requires PyTorch and the official TAPNet package. "
@@ -124,6 +129,46 @@ class BootstapBackend:
         )
         bundle.validate(frames_rgb.shape[0], len(queries))
         return bundle
+
+
+def _import_tapir_model():
+    try:
+        from tapnet.torch import tapir_model
+
+        return tapir_model
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"tensorflow", "tensorflow_datasets"}:
+            raise
+        return _import_tapir_model_without_legacy_init()
+
+
+def _import_tapir_model_without_legacy_init():
+    """Import TAPNet's PyTorch model without loading legacy TF/JAX exports."""
+
+    for name in list(sys.modules):
+        if name == "tapnet" or name.startswith("tapnet."):
+            sys.modules.pop(name, None)
+
+    spec = importlib.util.find_spec("tapnet")
+    if spec is None or spec.submodule_search_locations is None:
+        raise ModuleNotFoundError("No module named 'tapnet'")
+
+    root = Path(next(iter(spec.submodule_search_locations)))
+    package_spec = importlib.machinery.ModuleSpec("tapnet", loader=None, is_package=True)
+    package = types.ModuleType("tapnet")
+    package.__path__ = [str(root)]
+    package.__package__ = "tapnet"
+    package.__spec__ = package_spec
+    sys.modules["tapnet"] = package
+
+    torch_spec = importlib.machinery.ModuleSpec("tapnet.torch", loader=None, is_package=True)
+    torch_package = types.ModuleType("tapnet.torch")
+    torch_package.__path__ = [str(root / "torch")]
+    torch_package.__package__ = "tapnet.torch"
+    torch_package.__spec__ = torch_spec
+    sys.modules["tapnet.torch"] = torch_package
+
+    return importlib.import_module("tapnet.torch.tapir_model")
 
 
 def _resolve_device(device: str, torch_module) -> str:

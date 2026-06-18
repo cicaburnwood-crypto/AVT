@@ -27,6 +27,7 @@ foundationpose = [
 bootstap = [
   "torch>=2.0",
   "torchvision>=0.15",
+  "einops>=0.8",
   "tapnet @ git+https://github.com/google-deepmind/tapnet.git",
 ]
 dev = [
