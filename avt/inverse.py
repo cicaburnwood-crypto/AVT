@@ -24,7 +24,7 @@ from .tracking.base import PointTracker, TrackingBundle
 
 @dataclass
 class InverseTrackConfig:
-    window_size: int = 250
+    window_size: int = 80
     window_step: int = 100
     fps: float = 10.0
     query_stride: int = 10

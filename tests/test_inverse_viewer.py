@@ -37,7 +37,11 @@ from avt.schema import QueryPoint, TrackerInfo, WindowSpec
 from avt.tracking.base import TrackingBundle
 from avt.tracking.bootstap.backend import _query_points_for_resize, _tapnet_outputs_to_avt
 from avt.tracking.bootstap.config import bootstap_config_from_mapping
-from avt.tracking.cotracker_cache import CachedCoTrackerBackend, CACHE_SCHEMA
+from avt.tracking.cotracker_cache import (
+    CHUNKED_CACHE_SCHEMA,
+    CachedCoTrackerBackend,
+    CACHE_SCHEMA,
+)
 from avt.tracking.foundationpose import FoundationPoseBackend
 from avt.tracking.foundationpose.download import FOUNDATIONPOSE_WEIGHT_FILES
 from avt.viewer import build_viewer
@@ -61,7 +65,7 @@ class FakeTracker:
 
 
 def write_frames(root: Path, count: int = 6) -> None:
-    root.mkdir()
+    root.mkdir(parents=True)
     for idx in range(count):
         img = np.zeros((48, 64, 3), dtype=np.uint8)
         cv2.circle(img, (12 + idx, 24), 4, (255, 255, 255), -1)
@@ -203,6 +207,7 @@ def test_cli_output_defaults() -> None:
     assert track_args.output_root == DEFAULT_OUTPUT_ROOT
     assert all_args.output_root == DEFAULT_OUTPUT_ROOT
     assert viewer_args.viewer_dir == DEFAULT_VIEWER_ROOT
+    assert track_args.window_size == 80
     assert track_args.save_reverse_video is False
     assert track_args.save_path_mask is False
     assert all_args.build_viewer is False
@@ -285,6 +290,7 @@ def test_cli_accepts_cotracker_cache_backend() -> None:
             "every-frame",
         ]
     )
+    chunk_args = parser.parse_args(["cache-chunks", "--frames-root", "/tmp/frames"])
     track_args = parser.parse_args(
         [
             "track",
@@ -301,6 +307,9 @@ def test_cli_accepts_cotracker_cache_backend() -> None:
     assert cache_args.cache_frame_count == 100
     assert cache_args.cache_grid_stride == 16
     assert cache_args.cache_query_mode == "every-frame"
+    assert chunk_args.cache_chunk_size == 480
+    assert chunk_args.cache_window_size == 80
+    assert chunk_args.cache_chunk_step is None
     assert track_args.backend == "cotracker_cache"
     assert track_args.cotracker_cache == Path("/tmp/cache")
     assert track_args.cache_record_ids_only is True
@@ -395,15 +404,22 @@ def test_foundationpose_homography_adapter(tmp_path: Path) -> None:
     assert bundle.tracks[2:, 1, 0].tolist() == [10, 12]
 
 
-def write_synthetic_cotracker_cache(root: Path, frame_count: int = 6) -> Path:
-    root.mkdir()
+def write_synthetic_cotracker_cache(
+    root: Path,
+    frame_count: int = 6,
+    *,
+    frame_start: int = 0,
+    confidence_value: float = 0.75,
+) -> Path:
+    root.mkdir(parents=True)
     point_ids = np.array([0, 1, 2], dtype=np.int64)
     birth_reverse_times = np.array([0, 0, 2], dtype=np.int32)
-    source_birth_frames = np.array([5, 5, 3], dtype=np.int32)
+    frame_end = frame_start + frame_count
+    source_birth_frames = np.array([frame_end - 1, frame_end - 1, frame_end - 3], dtype=np.int32)
     seed_xy = np.array([[10, 10], [30, 20], [50, 30]], dtype=np.float32)
     tracks = np.zeros((frame_count, len(point_ids), 2), dtype=np.float32)
     visibility = np.ones((frame_count, len(point_ids)), dtype=bool)
-    confidence = np.ones((frame_count, len(point_ids)), dtype=np.float32) * 0.75
+    confidence = np.ones((frame_count, len(point_ids)), dtype=np.float32) * float(confidence_value)
     for t in range(frame_count):
         tracks[t, :, 0] = seed_xy[:, 0] + t
         tracks[t, :, 1] = seed_xy[:, 1] + t * 2
@@ -421,8 +437,8 @@ def write_synthetic_cotracker_cache(root: Path, frame_count: int = 6) -> Path:
     metadata = {
         "schema": CACHE_SCHEMA,
         "source_root": "/tmp/source",
-        "frame_start": 0,
-        "frame_end": frame_count,
+        "frame_start": frame_start,
+        "frame_end": frame_end,
         "frame_count": frame_count,
         "width": 64,
         "height": 48,
@@ -465,6 +481,72 @@ def test_cached_cotracker_backend_slices_cache(tmp_path: Path) -> None:
     assert not bundle.visibility[:, 2].any()
     assert bundle.confidence is not None
     assert bundle.confidence.shape == (4, 3)
+
+
+def test_chunked_cache_backend_selects_highest_confidence_chunk(tmp_path: Path) -> None:
+    chunked_root = tmp_path / "chunked"
+    low_chunk = write_synthetic_cotracker_cache(
+        chunked_root / "chunk_000000_000005",
+        frame_count=6,
+        frame_start=0,
+        confidence_value=0.25,
+    )
+    high_chunk = write_synthetic_cotracker_cache(
+        chunked_root / "chunk_000002_000007",
+        frame_count=6,
+        frame_start=2,
+        confidence_value=0.95,
+    )
+    manifest = {
+        "schema": CHUNKED_CACHE_SCHEMA,
+        "source_root": "/tmp/source",
+        "frame_count": 8,
+        "chunk_size": 6,
+        "window_size": 4,
+        "chunk_step": 2,
+        "overlap": 4,
+        "selection": {"mode": "full_window_single_chunk"},
+        "chunks": [
+            {
+                "chunk_id": "chunk_000000_000005",
+                "chunk_index": 0,
+                "path": str(low_chunk),
+                "metadata": str(low_chunk / "metadata.json"),
+                "frame_start": 0,
+                "frame_end": 6,
+                "frame_count": 6,
+                "point_count": 3,
+            },
+            {
+                "chunk_id": "chunk_000002_000007",
+                "chunk_index": 1,
+                "path": str(high_chunk),
+                "metadata": str(high_chunk / "metadata.json"),
+                "frame_start": 2,
+                "frame_end": 8,
+                "frame_count": 6,
+                "point_count": 3,
+            },
+        ],
+    }
+    (chunked_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    tracker = CachedCoTrackerBackend(chunked_root, max_match_distance=5)
+    tracker.set_window_context(WindowSpec(start=2, end=6), tmp_path)
+    frames = np.zeros((4, 48, 64, 3), dtype=np.uint8)
+    queries = [QueryPoint(id=0, reverse_time=0, x=12, y=14, side=0)]
+
+    bundle = tracker.track(frames, queries)
+
+    assert bundle.extra_metadata["cache_reference"]["chunk_id"] == "chunk_000002_000007"
+    assert bundle.extra_metadata["cache_reference"]["candidate_chunks"] == 2
+    assert bundle.extra_arrays["cache_point_ids"].tolist() == [0]
+    assert bundle.extra_arrays["cache_point_indices"].tolist() == [0]
+    assert bundle.extra_arrays["cache_chunk_indices"].tolist() == [1]
+    assert bundle.extra_arrays["cache_chunk_ids"].tolist() == ["chunk_000002_000007"]
+    assert bundle.extra_arrays["cache_unique_point_ids"].tolist() == ["chunk_000002_000007:0"]
+    assert bundle.confidence is not None
+    assert np.isclose(float(bundle.confidence.mean()), 0.95)
 
 
 def test_cache_record_ids_only_artifacts(tmp_path: Path) -> None:

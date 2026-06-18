@@ -84,27 +84,32 @@ def _window_tracks_from_cache(
         dtype=np.int64,
     )
     point_ids = arrays["cache_point_ids"].astype(np.int64)
-    tracks = np.full((t_len, len(point_ids), 2), np.nan, dtype=np.float32)
-    visibility = np.zeros((t_len, len(point_ids)), dtype=bool)
+    point_indices = (
+        arrays["cache_point_indices"].astype(np.int64)
+        if "cache_point_indices" in arrays
+        else point_ids
+    )
+    tracks = np.full((t_len, len(point_indices), 2), np.nan, dtype=np.float32)
+    visibility = np.zeros((t_len, len(point_indices)), dtype=bool)
     confidence = (
-        np.zeros((t_len, len(point_ids)), dtype=np.float32)
+        np.zeros((t_len, len(point_indices)), dtype=np.float32)
         if cache.confidence is not None
         else None
     )
-    valid = np.flatnonzero(point_ids >= 0)
+    valid = np.flatnonzero(point_indices >= 0)
     if valid.size:
-        cache_point_ids = point_ids[valid]
+        cache_point_indices = point_indices[valid]
         tracks[:, valid] = np.asarray(
-            cache.tracks[np.ix_(cache_indices, cache_point_ids)],
+            cache.tracks[np.ix_(cache_indices, cache_point_indices)],
             dtype=np.float32,
         )
         visibility[:, valid] = np.asarray(
-            cache.visibility[np.ix_(cache_indices, cache_point_ids)],
+            cache.visibility[np.ix_(cache_indices, cache_point_indices)],
             dtype=bool,
         )
         if confidence is not None and cache.confidence is not None:
             confidence[:, valid] = np.asarray(
-                cache.confidence[np.ix_(cache_indices, cache_point_ids)],
+                cache.confidence[np.ix_(cache_indices, cache_point_indices)],
                 dtype=np.float32,
             )
 

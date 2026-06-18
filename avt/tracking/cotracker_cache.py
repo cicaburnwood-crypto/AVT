@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from pathlib import Path
+import time
 from typing import Any
 
 import numpy as np
@@ -15,6 +16,9 @@ from .cotracker import CoTrackerBackend
 
 REGION_CHOICES = ("full", "bottom-third", "bottom-half")
 CACHE_SCHEMA = "avt_cotracker_cache_v1"
+CHUNKED_CACHE_SCHEMA = "avt_cotracker_chunked_cache_v1"
+DEFAULT_CACHE_CHUNK_SIZE = 480
+DEFAULT_CACHE_WINDOW_SIZE = 80
 
 
 @dataclass
@@ -32,6 +36,20 @@ class CoTrackerCacheConfig:
     hub_repo: str = "facebookresearch/co-tracker"
     hub_model: str = "cotracker3_offline"
     visibility_threshold: float = 0.9
+
+
+@dataclass
+class CoTrackerChunkCacheConfig:
+    chunk_size: int = DEFAULT_CACHE_CHUNK_SIZE
+    window_size: int = DEFAULT_CACHE_WINDOW_SIZE
+    chunk_step: int | None = None
+    cache: CoTrackerCacheConfig = field(default_factory=CoTrackerCacheConfig)
+
+    @property
+    def resolved_chunk_step(self) -> int:
+        if self.chunk_step is not None:
+            return int(self.chunk_step)
+        return max(1, int(self.chunk_size) - int(self.window_size))
 
 
 def _region_bounds(height: int, width: int, region: str) -> tuple[int, int, int, int]:
@@ -190,6 +208,157 @@ def build_cotracker_cache(
     return metadata
 
 
+def _chunk_ranges(frame_count: int, config: CoTrackerChunkCacheConfig) -> list[tuple[int, int]]:
+    chunk_size = int(config.chunk_size)
+    window_size = int(config.window_size)
+    chunk_step = int(config.resolved_chunk_step)
+    if chunk_size < 2:
+        raise ValueError("cache chunk_size must be at least 2")
+    if window_size < 2:
+        raise ValueError("cache window_size must be at least 2")
+    if chunk_size < window_size:
+        raise ValueError("cache chunk_size must be greater than or equal to window_size")
+    if chunk_step <= 0:
+        raise ValueError("cache chunk_step must be positive")
+    if chunk_step > chunk_size - window_size + 1:
+        raise ValueError(
+            "cache chunk_step is too large to guarantee every extraction window "
+            "fits inside a chunk"
+        )
+
+    ranges: list[tuple[int, int]] = []
+    start = 0
+    while start < frame_count:
+        end = min(frame_count, start + chunk_size)
+        if end - start >= 2:
+            ranges.append((start, end))
+        if end >= frame_count:
+            break
+        start += chunk_step
+    return ranges
+
+
+def _chunk_id(start: int, end: int) -> str:
+    return f"chunk_{start:06d}_{end - 1:06d}"
+
+
+def _cache_metadata_matches(path: Path, *, frame_start: int, frame_end: int, config: CoTrackerCacheConfig) -> bool:
+    metadata_path = path / "metadata.json"
+    if not metadata_path.exists():
+        return False
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if metadata.get("schema") != CACHE_SCHEMA:
+        return False
+    if int(metadata.get("frame_start", -1)) != int(frame_start):
+        return False
+    if int(metadata.get("frame_end", -1)) != int(frame_end):
+        return False
+    existing = metadata.get("config", {})
+    for key in ("grid_stride", "region", "query_mode", "query_frame_stride", "max_query_points"):
+        if existing.get(key) != getattr(config, key):
+            return False
+    arrays = metadata.get("arrays", {})
+    return all((path / arrays[name]).exists() for name in ("tracks", "visibility", "point_ids"))
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:d}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes:d}m{secs:02d}s"
+    return f"{secs:d}s"
+
+
+def build_cotracker_cache_chunks(
+    *,
+    source_root: Path,
+    frame_records: list[FrameRecord],
+    output_dir: Path,
+    config: CoTrackerChunkCacheConfig,
+    resume: bool = True,
+) -> dict[str, Any]:
+    """Build independent overlapping cache chunks and write a selector manifest."""
+
+    source_root = source_root.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    ranges = _chunk_ranges(len(frame_records), config)
+    if not ranges:
+        raise ValueError("No cache chunks were generated")
+
+    entries: list[dict[str, Any]] = []
+    started_at = time.monotonic()
+    for ordinal, (start, end) in enumerate(ranges, start=1):
+        chunk_id = _chunk_id(start, end)
+        chunk_root = output_dir / chunk_id
+        cache_config = CoTrackerCacheConfig(**asdict(config.cache))
+        cache_config.frame_start = start
+        cache_config.frame_count = end - start
+        if resume and _cache_metadata_matches(
+            chunk_root,
+            frame_start=start,
+            frame_end=end,
+            config=cache_config,
+        ):
+            metadata = json.loads((chunk_root / "metadata.json").read_text(encoding="utf-8"))
+            print(f"[{ordinal}/{len(ranges)}] reusing {chunk_id}", flush=True)
+        else:
+            print(f"[{ordinal}/{len(ranges)}] caching {chunk_id}", flush=True)
+            metadata = build_cotracker_cache(
+                source_root=source_root,
+                frame_records=frame_records,
+                output_dir=chunk_root,
+                config=cache_config,
+            )
+        entries.append(
+            {
+                "chunk_id": chunk_id,
+                "chunk_index": ordinal - 1,
+                "path": str(chunk_root.resolve()),
+                "metadata": str((chunk_root / "metadata.json").resolve()),
+                "frame_start": int(start),
+                "frame_end": int(end),
+                "frame_count": int(end - start),
+                "point_count": int(metadata["point_count"]),
+            }
+        )
+        elapsed = time.monotonic() - started_at
+        average = elapsed / ordinal
+        remaining = average * (len(ranges) - ordinal)
+        print(
+            f"[{ordinal}/{len(ranges)}] done {chunk_id} "
+            f"elapsed={_format_duration(elapsed)} eta={_format_duration(remaining)}",
+            flush=True,
+        )
+
+    manifest = {
+        "schema": CHUNKED_CACHE_SCHEMA,
+        "source_root": str(source_root),
+        "frame_count": int(len(frame_records)),
+        "chunk_size": int(config.chunk_size),
+        "window_size": int(config.window_size),
+        "chunk_step": int(config.resolved_chunk_step),
+        "overlap": int(config.chunk_size - config.resolved_chunk_step),
+        "selection": {
+            "mode": "full_window_single_chunk",
+            "score": "mean_confidence_with_unmatched_as_zero",
+            "tie_breakers": ["matched_queries", "mean_visibility", "boundary_margin"],
+        },
+        "cache_config": asdict(config.cache),
+        "chunks": entries,
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    with (output_dir / "manifest.jsonl").open("w", encoding="utf-8") as fh:
+        for entry in entries:
+            fh.write(json.dumps(entry, sort_keys=True) + "\n")
+    return manifest
+
+
 class CoTrackerCache:
     def __init__(self, path: Path, *, mmap_mode: str | None = "r") -> None:
         root = path if path.is_dir() else path.parent
@@ -236,14 +405,80 @@ class CoTrackerCache:
         return reverse_t
 
 
+@dataclass(frozen=True)
+class CoTrackerCacheChunk:
+    chunk_id: str
+    chunk_index: int
+    path: Path
+    metadata: Path
+    frame_start: int
+    frame_end: int
+    point_count: int
+
+    @property
+    def frame_count(self) -> int:
+        return self.frame_end - self.frame_start
+
+
+class CoTrackerChunkedCacheIndex:
+    def __init__(self, path: Path) -> None:
+        root = path if path.is_dir() else path.parent
+        manifest_path = root / "manifest.json" if path.is_dir() else path
+        self.root = root.resolve()
+        self.manifest_path = manifest_path.resolve()
+        self.manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+        if self.manifest.get("schema") != CHUNKED_CACHE_SCHEMA:
+            raise ValueError(f"Unsupported chunked cache schema: {self.manifest.get('schema')}")
+        self.source_root = Path(self.manifest["source_root"]).resolve()
+        self.chunks = [
+            CoTrackerCacheChunk(
+                chunk_id=str(entry["chunk_id"]),
+                chunk_index=int(entry["chunk_index"]),
+                path=Path(entry["path"]).resolve(),
+                metadata=Path(entry["metadata"]).resolve(),
+                frame_start=int(entry["frame_start"]),
+                frame_end=int(entry["frame_end"]),
+                point_count=int(entry["point_count"]),
+            )
+            for entry in self.manifest["chunks"]
+        ]
+
+    @classmethod
+    def maybe_load(cls, path: Path) -> "CoTrackerChunkedCacheIndex | None":
+        root = path if path.is_dir() else path.parent
+        manifest_path = root / "manifest.json" if path.is_dir() else path
+        if not manifest_path.exists():
+            return None
+        try:
+            metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if metadata.get("schema") != CHUNKED_CACHE_SCHEMA:
+            return None
+        return cls(manifest_path)
+
+    def candidates_for_window(self, window: WindowSpec) -> list[CoTrackerCacheChunk]:
+        return [
+            chunk
+            for chunk in self.chunks
+            if chunk.frame_start <= window.start and chunk.frame_end >= window.end
+        ]
+
+
 @dataclass
 class CachedCoTrackerBackend:
     cache_path: Path
     max_match_distance: float = 12.0
+    source_root: Path | None = None
     mmap_mode: str | None = "r"
 
     def __post_init__(self) -> None:
-        self.cache = CoTrackerCache(self.cache_path, mmap_mode=self.mmap_mode)
+        self.chunk_index = CoTrackerChunkedCacheIndex.maybe_load(self.cache_path)
+        self.cache = (
+            None
+            if self.chunk_index is not None
+            else CoTrackerCache(self.cache_path, mmap_mode=self.mmap_mode)
+        )
         self.window: WindowSpec | None = None
         self.output_dir: Path | None = None
 
@@ -251,11 +486,11 @@ class CachedCoTrackerBackend:
         self.window = window
         self.output_dir = output_dir
 
-    def _visible_candidates(self, cache_reverse_t: int) -> tuple[np.ndarray, np.ndarray]:
-        visible = np.asarray(self.cache.visibility[cache_reverse_t]).astype(bool)
+    def _visible_candidates(self, cache: CoTrackerCache, cache_reverse_t: int) -> tuple[np.ndarray, np.ndarray]:
+        visible = np.asarray(cache.visibility[cache_reverse_t]).astype(bool)
         if not visible.any():
             return np.empty((0,), dtype=np.int64), np.empty((0, 2), dtype=np.float32)
-        points = np.asarray(self.cache.tracks[cache_reverse_t], dtype=np.float32)
+        points = np.asarray(cache.tracks[cache_reverse_t], dtype=np.float32)
         finite = np.isfinite(points).all(axis=1)
         candidates = np.flatnonzero(visible & finite)
         if candidates.size == 0:
@@ -264,13 +499,14 @@ class CachedCoTrackerBackend:
 
     def _match_query_group(
         self,
+        cache: CoTrackerCache,
         queries: list[QueryPoint],
         query_indices: np.ndarray,
         cache_reverse_t: int,
     ) -> tuple[np.ndarray, np.ndarray]:
         matched = np.full(query_indices.size, -1, dtype=np.int64)
         distances = np.full(query_indices.size, np.inf, dtype=np.float32)
-        candidates, points = self._visible_candidates(cache_reverse_t)
+        candidates, points = self._visible_candidates(cache, cache_reverse_t)
         if candidates.size == 0:
             return matched, distances
 
@@ -303,26 +539,30 @@ class CachedCoTrackerBackend:
         distances[ok] = distance_values[ok].astype(np.float32)
         return matched, distances
 
-    def track(self, frames_rgb: np.ndarray, queries: list[QueryPoint]) -> TrackingBundle:
+    def _track_with_cache(
+        self,
+        cache: CoTrackerCache,
+        frames_rgb: np.ndarray,
+        queries: list[QueryPoint],
+        *,
+        chunk: CoTrackerCacheChunk | None = None,
+        candidate_count: int = 1,
+    ) -> tuple[TrackingBundle, tuple[float, int, float, int]]:
         if self.window is None:
             raise RuntimeError("CachedCoTrackerBackend needs set_window_context before track().")
-        if frames_rgb.ndim != 4 or frames_rgb.shape[-1] != 3:
-            raise ValueError("frames_rgb must have shape [T,H,W,3]")
-        if not queries:
-            raise ValueError("No query points were provided")
 
         frame_count = len(frames_rgb)
-        cache_start_reverse = self.cache.reverse_index_for_source_frame(self.window.end - 1)
+        cache_start_reverse = cache.reverse_index_for_source_frame(self.window.end - 1)
         cache_indices = np.arange(cache_start_reverse, cache_start_reverse + frame_count, dtype=np.int64)
-        if cache_indices[-1] >= self.cache.frame_count:
+        if cache_indices[-1] >= cache.frame_count:
             raise IndexError(
                 f"Window {self.window.id} extends outside cache reverse range "
-                f"at {int(cache_indices[-1])} >= {self.cache.frame_count}"
+                f"at {int(cache_indices[-1])} >= {cache.frame_count}"
             )
 
         query_cache_indices = np.array(
             [
-                self.cache.reverse_index_for_source_frame(self.window.end - 1 - query.reverse_time)
+                cache.reverse_index_for_source_frame(self.window.end - 1 - query.reverse_time)
                 for query in queries
             ],
             dtype=np.int32,
@@ -336,6 +576,7 @@ class CachedCoTrackerBackend:
         for cache_reverse_t in sorted(set(int(value) for value in query_cache_indices)):
             query_indices = np.flatnonzero(query_cache_indices == cache_reverse_t)
             group_matches, group_distances = self._match_query_group(
+                cache,
                 queries,
                 query_indices,
                 cache_reverse_t,
@@ -347,31 +588,31 @@ class CachedCoTrackerBackend:
         visibility = np.zeros((frame_count, len(queries)), dtype=bool)
         confidence = (
             np.zeros((frame_count, len(queries)), dtype=np.float32)
-            if self.cache.confidence is not None
+            if cache.confidence is not None
             else None
         )
         confidence_components = {
             name: np.zeros((frame_count, len(queries)), dtype=np.float32)
-            for name in self.cache.confidence_components
+            for name in cache.confidence_components
         }
 
         valid_query_indices = np.flatnonzero(matched >= 0)
         if valid_query_indices.size:
             cache_point_indices = matched[valid_query_indices]
             tracks[:, valid_query_indices] = np.asarray(
-                self.cache.tracks[np.ix_(cache_indices, cache_point_indices)],
+                cache.tracks[np.ix_(cache_indices, cache_point_indices)],
                 dtype=np.float32,
             )
             visibility[:, valid_query_indices] = np.asarray(
-                self.cache.visibility[np.ix_(cache_indices, cache_point_indices)],
+                cache.visibility[np.ix_(cache_indices, cache_point_indices)],
                 dtype=bool,
             )
-            if confidence is not None and self.cache.confidence is not None:
+            if confidence is not None and cache.confidence is not None:
                 confidence[:, valid_query_indices] = np.asarray(
-                    self.cache.confidence[np.ix_(cache_indices, cache_point_indices)],
+                    cache.confidence[np.ix_(cache_indices, cache_point_indices)],
                     dtype=np.float32,
                 )
-            for name, component in self.cache.confidence_components.items():
+            for name, component in cache.confidence_components.items():
                 confidence_components[name][:, valid_query_indices] = np.asarray(
                     component[np.ix_(cache_indices, cache_point_indices)],
                     dtype=np.float32,
@@ -390,8 +631,33 @@ class CachedCoTrackerBackend:
         source_birth_frames = np.full(len(queries), -1, dtype=np.int32)
         ok = matched >= 0
         if ok.any():
-            birth_times[ok] = np.asarray(self.cache.birth_reverse_times[matched[ok]], dtype=np.int32)
-            source_birth_frames[ok] = np.asarray(self.cache.source_birth_frames[matched[ok]], dtype=np.int32)
+            birth_times[ok] = np.asarray(cache.birth_reverse_times[matched[ok]], dtype=np.int32)
+            source_birth_frames[ok] = np.asarray(cache.source_birth_frames[matched[ok]], dtype=np.int32)
+
+        cache_point_ids = np.full(len(queries), -1, dtype=np.int64)
+        if ok.any():
+            cache_point_ids[ok] = np.asarray(cache.point_ids[matched[ok]], dtype=np.int64)
+
+        chunk_id = chunk.chunk_id if chunk is not None else cache.root.name
+        chunk_index = chunk.chunk_index if chunk is not None else 0
+        cache_chunk_indices = np.full(len(queries), -1, dtype=np.int32)
+        cache_chunk_indices[ok] = chunk_index
+        cache_chunk_ids = np.array([chunk_id if matched_idx >= 0 else "" for matched_idx in matched], dtype=f"<U{max(1, len(chunk_id))}")
+        unique_ids = np.array(
+            [
+                f"{chunk_id}:{int(point_id)}" if point_id >= 0 else ""
+                for point_id in cache_point_ids
+            ],
+            dtype=f"<U{max(1, len(chunk_id) + 32)}",
+        )
+
+        if confidence is not None:
+            selection_values = confidence
+        else:
+            selection_values = visibility.astype(np.float32)
+        selection_score = float(np.mean(selection_values)) if selection_values.size else 0.0
+        mean_visibility = float(np.mean(visibility)) if visibility.size else 0.0
+        boundary_margin = min(self.window.start - cache.frame_start, cache.frame_end - self.window.end)
 
         bundle = TrackingBundle(
             tracks=tracks,
@@ -399,7 +665,11 @@ class CachedCoTrackerBackend:
             confidence=confidence,
             confidence_components=confidence_components,
             extra_arrays={
-                "cache_point_ids": matched.astype(np.int64),
+                "cache_point_ids": cache_point_ids,
+                "cache_point_indices": matched.astype(np.int64),
+                "cache_chunk_indices": cache_chunk_indices,
+                "cache_chunk_ids": cache_chunk_ids,
+                "cache_unique_point_ids": unique_ids,
                 "cache_query_reverse_times": query_cache_indices,
                 "cache_query_source_frames": source_query_frames,
                 "cache_birth_reverse_times": birth_times,
@@ -409,23 +679,85 @@ class CachedCoTrackerBackend:
             extra_metadata={
                 "cache_reference": {
                     "schema": CACHE_SCHEMA,
-                    "path": str(self.cache.root),
-                    "metadata": str(self.cache.metadata_path),
-                    "frame_start": self.cache.frame_start,
-                    "frame_end": self.cache.frame_end,
+                    "path": str(cache.root),
+                    "metadata": str(cache.metadata_path),
+                    "frame_start": cache.frame_start,
+                    "frame_end": cache.frame_end,
+                    "chunk_id": chunk_id,
+                    "chunk_index": int(chunk_index),
                     "max_match_distance": float(self.max_match_distance),
                     "matched_queries": int(ok.sum()),
                     "query_count": int(len(queries)),
+                    "selection_score": selection_score,
+                    "selection_metric": "mean_confidence_with_unmatched_as_zero"
+                    if confidence is not None
+                    else "mean_visibility_with_unmatched_as_zero",
+                    "candidate_chunks": int(candidate_count),
+                    "boundary_margin_frames": int(boundary_margin),
                 }
             },
             tracker=TrackerInfo(
                 name="cotracker_cache",
                 parameters={
-                    "cache_path": str(self.cache.root),
+                    "cache_path": str(cache.root),
                     "max_match_distance": float(self.max_match_distance),
-                    "source_tracker": self.cache.metadata.get("tracker"),
+                    "source_tracker": cache.metadata.get("tracker"),
                 },
             ),
         )
         bundle.validate(frame_count, len(queries))
-        return bundle
+        return bundle, (selection_score, int(ok.sum()), mean_visibility, int(boundary_margin))
+
+    def track(self, frames_rgb: np.ndarray, queries: list[QueryPoint]) -> TrackingBundle:
+        if self.window is None:
+            raise RuntimeError("CachedCoTrackerBackend needs set_window_context before track().")
+        if frames_rgb.ndim != 4 or frames_rgb.shape[-1] != 3:
+            raise ValueError("frames_rgb must have shape [T,H,W,3]")
+        if not queries:
+            raise ValueError("No query points were provided")
+
+        if self.chunk_index is None:
+            if self.cache is None:
+                raise RuntimeError("Cache backend was not initialized")
+            bundle, _ = self._track_with_cache(self.cache, frames_rgb, queries)
+            return bundle
+
+        candidates = self.chunk_index.candidates_for_window(self.window)
+        if not candidates:
+            raise IndexError(
+                f"No CoTracker cache chunk fully covers window {self.window.id}; "
+                f"build chunks with overlap at least the extraction window size."
+            )
+
+        best_bundle: TrackingBundle | None = None
+        best_score: tuple[float, int, float, int] | None = None
+        best_chunk: CoTrackerCacheChunk | None = None
+        for chunk in candidates:
+            cache = CoTrackerCache(chunk.path, mmap_mode=self.mmap_mode)
+            bundle, score = self._track_with_cache(
+                cache,
+                frames_rgb,
+                queries,
+                chunk=chunk,
+                candidate_count=len(candidates),
+            )
+            if best_score is None or score > best_score:
+                best_bundle = bundle
+                best_score = score
+                best_chunk = chunk
+
+        if best_bundle is None or best_chunk is None:
+            raise RuntimeError(f"Could not select a cache chunk for window {self.window.id}")
+        best_bundle.extra_metadata["cache_reference"]["chunked_schema"] = CHUNKED_CACHE_SCHEMA
+        best_bundle.extra_metadata["cache_reference"]["chunked_cache_root"] = str(self.chunk_index.root)
+        best_bundle.extra_metadata["cache_reference"]["chunked_manifest"] = str(self.chunk_index.manifest_path)
+        best_bundle.tracker = TrackerInfo(
+            name=best_bundle.tracker.name,
+            version=best_bundle.tracker.version,
+            parameters={
+                **(best_bundle.tracker.parameters or {}),
+                "chunked_cache_root": str(self.chunk_index.root),
+                "chunk_selection": "highest_confidence_full_window",
+            },
+        )
+        return best_bundle

@@ -85,6 +85,28 @@ The command writes a reusable cache directory under `outputs/cotracker_caches`
 with memory-mappable `.npy` arrays and `metadata.json`. Time is stored in global
 reverse-video order: cache time 0 is the last frame in the cached range.
 
+For long videos, build overlapping independent chunks instead of one huge
+cache:
+
+```bash
+avt cache-chunks \
+  --frames-root /path/to/images \
+  --source-type image_dir \
+  --cache-chunk-size 480 \
+  --cache-window-size 80 \
+  --cache-grid-stride 8 \
+  --cache-region bottom-third \
+  --cache-query-mode last-frame \
+  --cotracker-device cuda \
+  --cotracker-batch-size 1024
+```
+
+`cache-chunks` defaults to `--cache-chunk-size 480` and
+`--cache-window-size 80`. If `--cache-chunk-step` is omitted it uses
+`chunk_size - window_size`, so the default step is 400 frames and every
+80-frame extraction window can fit inside at least one cache chunk. Chunks are
+not merged and do not share point identity.
+
 Then extract AVT windows from the cache:
 
 ```bash
@@ -100,6 +122,14 @@ avt all \
   --window-step 1 \
   --save-path-mask
 ```
+
+When `--cotracker-cache` points at a chunked cache manifest/root, extraction
+selects one chunk that fully contains each window. If multiple chunks cover the
+window, AVT evaluates each candidate and uses the one with the highest mean
+tracker confidence, with unmatched points counted as zero confidence. In
+ID-only artifacts, point identity is chunk-qualified with arrays such as
+`cache_chunk_ids` and `cache_unique_point_ids`, for example
+`chunk_000400_000879:17`.
 
 By default this cached backend still writes regular `tracks_reverse` arrays for
 compatibility. Add `--cache-record-ids-only` to write compact per-window
@@ -120,8 +150,11 @@ avt all \
 ```
 
 In ID-only mode `tracks.npz` stores arrays such as `cache_point_ids`,
+`cache_point_indices`, `cache_chunk_ids`, `cache_unique_point_ids`,
 `cache_query_source_frames`, `cache_birth_source_frames`, and
-`cache_match_distances` instead of duplicating full tracks per window. The
+`cache_match_distances` instead of duplicating full tracks per window.
+`cache_point_ids` are local to the selected chunk; use
+`cache_unique_point_ids` when IDs need to be unique across chunked caches. The
 viewer can materialize those tracks from the referenced cache later.
 
 Cache query modes:
@@ -131,6 +164,22 @@ Cache query modes:
 - `every-frame`: seed the grid repeatedly through reverse time. This records
   possible replacement IDs for later frames without changing extractor
   parameters, at the cost of a larger cache.
+
+For the current top-10 ride cache batch, use the resumable runner:
+
+```bash
+python scripts/run_top10_cache_chunks.py \
+  --data-root data \
+  --prepared-root data/prepared_top10_cache \
+  --output-root outputs/top10_cotracker_cache_chunks \
+  --camera front \
+  --cache-chunk-size 480 \
+  --cache-window-size 80
+```
+
+The runner prepares front-camera frames from the ride HLS playlists when needed
+and then writes fixed chunk-cache directories, so reruns reuse completed frames
+and completed chunks. It does not run extraction or visualization.
 
 ## BootsTAPIR Backend
 

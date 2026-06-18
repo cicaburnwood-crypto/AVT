@@ -15,6 +15,9 @@ from .viewer import build_viewer
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs"
 DEFAULT_VIEWER_ROOT = DEFAULT_OUTPUT_ROOT / "viewer_runs"
 DEFAULT_CACHE_ROOT = DEFAULT_OUTPUT_ROOT / "cotracker_caches"
+DEFAULT_WINDOW_SIZE = 80
+DEFAULT_CACHE_CHUNK_SIZE = 480
+DEFAULT_CACHE_WINDOW_SIZE = 80
 
 
 def _create_unique_run_dir(base: Path, preferred_name: str | None = None) -> Path:
@@ -42,7 +45,7 @@ def _add_source_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--window-size", type=int, default=250)
+    parser.add_argument("--window-size", type=int, default=DEFAULT_WINDOW_SIZE)
     parser.add_argument("--window-step", type=int, default=100)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--query-stride", type=int, default=10)
@@ -154,6 +157,7 @@ def _tracker_from_args(args: argparse.Namespace):
         return CachedCoTrackerBackend(
             cache_path=args.cotracker_cache,
             max_match_distance=args.cache_match_distance,
+            source_root=args.frames_root,
         )
     if args.backend == "foundationpose":
         from .tracking.foundationpose import FoundationPoseBackend
@@ -229,6 +233,59 @@ def cmd_cache(args: argparse.Namespace) -> int:
                 "points": metadata["point_count"],
                 "region": metadata["config"]["region"],
                 "query_mode": metadata["config"]["query_mode"],
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_cache_chunks(args: argparse.Namespace) -> int:
+    from .tracking.cotracker_cache import (
+        CoTrackerCacheConfig,
+        CoTrackerChunkCacheConfig,
+        build_cotracker_cache_chunks,
+    )
+
+    records = read_frame_records(args.frames_root, args.source_type)
+    output_root = _create_unique_run_dir(args.output_root)
+    manifest = build_cotracker_cache_chunks(
+        source_root=args.frames_root,
+        frame_records=records,
+        output_dir=output_root,
+        resume=bool(args.cache_resume),
+        config=CoTrackerChunkCacheConfig(
+            chunk_size=args.cache_chunk_size,
+            window_size=args.cache_window_size,
+            chunk_step=args.cache_chunk_step,
+            cache=CoTrackerCacheConfig(
+                frame_start=0,
+                frame_count=args.cache_chunk_size,
+                grid_stride=args.cache_grid_stride,
+                region=args.cache_region,
+                query_mode=args.cache_query_mode,
+                query_frame_stride=args.cache_query_frame_stride,
+                max_query_points=args.cache_max_query_points,
+                device=args.cotracker_device,
+                batch_size=args.cotracker_batch_size,
+                torch_home=args.torch_home,
+                hub_repo=args.cotracker_hub_repo,
+                hub_model=args.cotracker_hub_model,
+                visibility_threshold=args.cotracker_visibility_threshold,
+            ),
+        ),
+    )
+    print(
+        json.dumps(
+            {
+                "cache_base": str(args.output_root),
+                "cache_root": str(output_root),
+                "manifest": str(output_root / "manifest.json"),
+                "frames": manifest["frame_count"],
+                "chunks": len(manifest["chunks"]),
+                "chunk_size": manifest["chunk_size"],
+                "chunk_step": manifest["chunk_step"],
+                "window_size": manifest["window_size"],
             },
             indent=2,
         )
@@ -465,6 +522,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     add_cotracker_args(cache)
     cache.set_defaults(func=cmd_cache)
+
+    cache_chunks = sub.add_parser(
+        "cache-chunks",
+        help="Precompute overlapping independent CoTracker cache chunks.",
+    )
+    _add_source_args(cache_chunks)
+    cache_chunks.add_argument(
+        "--output-root",
+        type=Path,
+        default=DEFAULT_CACHE_ROOT,
+        help=f"Base directory for unique chunked cache runs. Default: {DEFAULT_CACHE_ROOT}",
+    )
+    cache_chunks.add_argument("--cache-chunk-size", type=int, default=DEFAULT_CACHE_CHUNK_SIZE)
+    cache_chunks.add_argument(
+        "--cache-window-size",
+        type=int,
+        default=DEFAULT_CACHE_WINDOW_SIZE,
+        help="Extraction window size to guarantee full chunk coverage. Default: 80.",
+    )
+    cache_chunks.add_argument(
+        "--cache-chunk-step",
+        type=int,
+        default=None,
+        help="Frame step between chunks. Defaults to chunk_size - window_size.",
+    )
+    cache_chunks.add_argument("--cache-grid-stride", type=int, default=8)
+    cache_chunks.add_argument(
+        "--cache-region",
+        choices=("full", "bottom-third", "bottom-half"),
+        default="full",
+    )
+    cache_chunks.add_argument(
+        "--cache-query-mode",
+        choices=("last-frame", "every-frame"),
+        default="last-frame",
+    )
+    cache_chunks.add_argument("--cache-query-frame-stride", type=int, default=1)
+    cache_chunks.add_argument(
+        "--cache-max-query-points",
+        type=int,
+        default=0,
+        help="Optional cap for smoke tests. 0 means no cap.",
+    )
+    cache_chunks.add_argument(
+        "--cache-resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse complete chunk directories when rerunning in an existing root.",
+    )
+    add_cotracker_args(cache_chunks)
+    cache_chunks.set_defaults(func=cmd_cache_chunks)
 
     track = sub.add_parser("track", help="Run inverse-video point tracking.")
     _add_source_args(track)
