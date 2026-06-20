@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 import json
 from pathlib import Path
 import time
@@ -25,9 +25,9 @@ DEFAULT_CACHE_WINDOW_SIZE = 80
 class CoTrackerCacheConfig:
     frame_start: int = 0
     frame_count: int | None = None
-    grid_stride: int = 8
-    region: str = "full"
-    query_mode: str = "last-frame"
+    grid_stride: int = 1
+    region: str = "bottom-third"
+    query_mode: str = "confidence-refresh"
     query_frame_stride: int = 1
     max_query_points: int = 0
     device: str = "auto"
@@ -36,6 +36,7 @@ class CoTrackerCacheConfig:
     hub_repo: str = "facebookresearch/co-tracker"
     hub_model: str = "cotracker3_offline"
     visibility_threshold: float = 0.9
+    abort_confidence_threshold: float | None = None
 
 
 @dataclass
@@ -52,6 +53,120 @@ class CoTrackerChunkCacheConfig:
         return max(1, int(self.chunk_size) - int(self.window_size))
 
 
+def load_cotracker_cache_config_yaml(path: Path) -> CoTrackerChunkCacheConfig:
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError("CoTracker cache YAML configs require PyYAML.") from exc
+
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise ValueError(f"CoTracker cache config must be a YAML mapping: {path}")
+    return cotracker_cache_config_from_mapping(data)
+
+
+def cotracker_cache_config_from_mapping(data: dict[str, Any]) -> CoTrackerChunkCacheConfig:
+    root = data.get("cotracker_cache", data.get("cache_config", data))
+    if not isinstance(root, dict):
+        raise ValueError("cotracker_cache must be a mapping")
+
+    chunk_data = _optional_mapping(root.get("chunk"), "chunk")
+    cache_data = _optional_mapping(root.get("cache"), "cache")
+    tracker_data = _optional_mapping(root.get("tracker", root.get("cotracker")), "tracker")
+
+    chunk_keys = {field.name for field in fields(CoTrackerChunkCacheConfig)} - {"cache"}
+    cache_keys = {field.name for field in fields(CoTrackerCacheConfig)}
+    top_level_allowed = {
+        "cotracker_cache",
+        "cache_config",
+        "chunk",
+        "cache",
+        "tracker",
+        "cotracker",
+        *chunk_keys,
+        *cache_keys,
+        "bad_track_confidence_threshold",
+    }
+    unknown_top = sorted(set(root) - top_level_allowed)
+    if unknown_top:
+        raise ValueError(f"Unknown CoTracker cache config keys: {', '.join(unknown_top)}")
+
+    chunk_values = {
+        field.name: getattr(CoTrackerChunkCacheConfig(), field.name)
+        for field in fields(CoTrackerChunkCacheConfig)
+        if field.name != "cache"
+    }
+    cache_values = {
+        field.name: getattr(CoTrackerCacheConfig(), field.name)
+        for field in fields(CoTrackerCacheConfig)
+    }
+
+    _apply_values(chunk_values, root, chunk_keys)
+    _apply_values(cache_values, root, cache_keys)
+    _apply_bad_track_alias(cache_values, root)
+
+    if chunk_data is not None:
+        chunk_aliases = {"size": "chunk_size", "step": "chunk_step"}
+        _apply_values(chunk_values, chunk_data, chunk_keys, aliases=chunk_aliases)
+        unknown = sorted(set(chunk_data) - set(chunk_aliases) - chunk_keys)
+        if unknown:
+            raise ValueError(f"Unknown CoTracker cache chunk keys: {', '.join(unknown)}")
+
+    if cache_data is not None:
+        _apply_values(cache_values, cache_data, cache_keys)
+        _apply_bad_track_alias(cache_values, cache_data)
+        unknown = sorted(set(cache_data) - cache_keys - {"bad_track_confidence_threshold"})
+        if unknown:
+            raise ValueError(f"Unknown CoTracker cache keys: {', '.join(unknown)}")
+
+    if tracker_data is not None:
+        tracker_keys = {
+            "device",
+            "batch_size",
+            "torch_home",
+            "hub_repo",
+            "hub_model",
+            "visibility_threshold",
+        }
+        tracker_aliases = {"cotracker_visibility_threshold": "visibility_threshold"}
+        _apply_values(cache_values, tracker_data, tracker_keys, aliases=tracker_aliases)
+        unknown = sorted(set(tracker_data) - tracker_keys - set(tracker_aliases))
+        if unknown:
+            raise ValueError(f"Unknown CoTracker tracker keys: {', '.join(unknown)}")
+
+    cache = CoTrackerCacheConfig(**cache_values)
+    return CoTrackerChunkCacheConfig(**chunk_values, cache=cache)
+
+
+def _optional_mapping(value: Any, name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a mapping")
+    return value
+
+
+def _apply_values(
+    target: dict[str, Any],
+    source: dict[str, Any],
+    allowed: set[str],
+    *,
+    aliases: dict[str, str] | None = None,
+) -> None:
+    aliases = aliases or {}
+    for source_key, target_key in aliases.items():
+        if source_key in source:
+            target[target_key] = source[source_key]
+    for key in allowed:
+        if key in source:
+            target[key] = source[key]
+
+
+def _apply_bad_track_alias(cache_values: dict[str, Any], source: dict[str, Any]) -> None:
+    if "bad_track_confidence_threshold" in source:
+        cache_values["abort_confidence_threshold"] = source["bad_track_confidence_threshold"]
+
+
 def _region_bounds(height: int, width: int, region: str) -> tuple[int, int, int, int]:
     if region == "full":
         return 0, height, 0, width
@@ -65,6 +180,8 @@ def _region_bounds(height: int, width: int, region: str) -> tuple[int, int, int,
 def _grid_xy(height: int, width: int, *, stride: int, region: str) -> np.ndarray:
     if stride <= 0:
         raise ValueError("grid_stride must be positive")
+    if stride != 1:
+        raise ValueError("CoTracker cache uses raw dense pixels only; grid_stride must be 1")
     y0, y1, x0, x1 = _region_bounds(height, width, region)
     xs = np.arange(x0, x1, stride, dtype=np.float32)
     ys = np.arange(y0, y1, stride, dtype=np.float32)
@@ -84,30 +201,115 @@ def _cache_queries(
     grid = _grid_xy(height, width, stride=config.grid_stride, region=config.region)
     if config.query_frame_stride <= 0:
         raise ValueError("query_frame_stride must be positive")
-
-    if config.query_mode == "last-frame":
-        reverse_times = [0]
-    elif config.query_mode == "every-frame":
-        reverse_times = list(range(0, frame_count, config.query_frame_stride))
-    else:
-        raise ValueError("query_mode must be 'last-frame' or 'every-frame'")
+    if config.query_frame_stride != 1:
+        raise ValueError("confidence-refresh cache checks every frame; query_frame_stride must be 1")
+    if config.query_mode != "confidence-refresh":
+        raise ValueError("cache query_mode must be 'confidence-refresh'")
+    if frame_count < 1:
+        raise ValueError("frame_count must be positive")
 
     queries: list[QueryPoint] = []
-    for reverse_time in reverse_times:
-        for x, y in grid:
-            queries.append(
-                QueryPoint(
-                    id=len(queries),
-                    reverse_time=int(reverse_time),
-                    x=float(x),
-                    y=float(y),
-                    side=0,
-                    source="cotracker_cache_grid",
-                )
+    for x, y in grid:
+        queries.append(
+            QueryPoint(
+                id=len(queries),
+                reverse_time=0,
+                x=float(x),
+                y=float(y),
+                side=0,
+                source="cotracker_cache_dense_seed",
             )
-            if config.max_query_points > 0 and len(queries) >= config.max_query_points:
-                return queries
+        )
+        if config.max_query_points > 0 and len(queries) >= config.max_query_points:
+            return queries
     return queries
+
+
+def _abort_threshold(config: CoTrackerCacheConfig) -> float:
+    if config.abort_confidence_threshold is not None:
+        return float(config.abort_confidence_threshold)
+    return float(config.visibility_threshold)
+
+
+def _reliable_mask(bundle: TrackingBundle, *, threshold: float) -> np.ndarray:
+    reliable = np.isfinite(bundle.tracks).all(axis=2) & bundle.visibility.astype(bool)
+    if bundle.confidence is not None:
+        confidence = np.asarray(bundle.confidence, dtype=np.float32)
+        reliable &= np.isfinite(confidence) & (confidence >= float(threshold))
+    return reliable
+
+
+def _first_abort_times(
+    bundle: TrackingBundle,
+    queries: list[QueryPoint],
+    *,
+    threshold: float,
+) -> np.ndarray:
+    reliable = _reliable_mask(bundle, threshold=threshold)
+    abort_times = np.full(len(queries), -1, dtype=np.int32)
+    for idx, query in enumerate(queries):
+        start = int(query.reverse_time) + 1
+        if start >= reliable.shape[0]:
+            continue
+        failed = np.flatnonzero(~reliable[start:, idx])
+        if failed.size:
+            abort_times[idx] = int(start + failed[0])
+    return abort_times
+
+
+def _clamp_xy(xy: np.ndarray, *, height: int, width: int) -> tuple[float, float]:
+    x = float(np.clip(float(xy[0]), 0.0, max(0.0, float(width - 1))))
+    y = float(np.clip(float(xy[1]), 0.0, max(0.0, float(height - 1))))
+    return x, y
+
+
+def _refresh_birth_xy(
+    bundle: TrackingBundle,
+    query: QueryPoint,
+    query_index: int,
+    abort_t: int,
+    *,
+    height: int,
+    width: int,
+) -> tuple[float, float]:
+    candidates = []
+    if 0 <= abort_t < bundle.tracks.shape[0]:
+        candidates.append(np.asarray(bundle.tracks[abort_t, query_index], dtype=np.float32))
+    previous_t = int(abort_t) - 1
+    if 0 <= previous_t < bundle.tracks.shape[0]:
+        candidates.append(np.asarray(bundle.tracks[previous_t, query_index], dtype=np.float32))
+    candidates.append(np.array([query.x, query.y], dtype=np.float32))
+
+    for xy in candidates:
+        if np.isfinite(xy).all():
+            return _clamp_xy(xy, height=height, width=width)
+    return _clamp_xy(np.array([query.x, query.y], dtype=np.float32), height=height, width=width)
+
+
+def _truncate_bundle_at_aborts(bundle: TrackingBundle, abort_times: np.ndarray) -> None:
+    for idx, abort_t in enumerate(abort_times):
+        if abort_t < 0:
+            continue
+        bundle.tracks[int(abort_t) :, idx] = np.nan
+        bundle.visibility[int(abort_t) :, idx] = False
+        if bundle.confidence is not None:
+            bundle.confidence[int(abort_t) :, idx] = 0.0
+        for component in bundle.confidence_components.values():
+            component[int(abort_t) :, idx] = 0.0
+
+
+def _concat_confidence_components(bundles: list[TrackingBundle]) -> dict[str, np.ndarray]:
+    names = sorted({name for bundle in bundles for name in bundle.confidence_components})
+    components: dict[str, np.ndarray] = {}
+    for name in names:
+        pieces = []
+        for bundle in bundles:
+            if name in bundle.confidence_components:
+                pieces.append(bundle.confidence_components[name].astype(np.float32))
+            else:
+                pieces.append(np.zeros(bundle.visibility.shape, dtype=np.float32))
+        components[name] = np.concatenate(pieces, axis=1).astype(np.float32)
+    return components
 
 
 def _write_array(path: Path, array: np.ndarray) -> str:
@@ -123,7 +325,14 @@ def build_cotracker_cache(
     output_dir: Path,
     config: CoTrackerCacheConfig,
 ) -> dict[str, Any]:
-    """Run CoTracker once and write a reusable dense/global track cache."""
+    """Write a reusable dense cache with confidence-gated ID refresh.
+
+    The cache seeds the selected region densely on reverse frame 0. Each point is
+    checked on every later reverse frame; at the first low-confidence/invisible
+    frame, that parent ID is aborted and exactly one child ID is born at the
+    abort frame. No replacement IDs are created while the parent remains
+    reliable.
+    """
 
     source_root = source_root.resolve()
     if config.frame_start < 0:
@@ -140,13 +349,13 @@ def build_cotracker_cache(
     frames = load_frame_window(source_root, frame_records, config.frame_start, frame_end)
     frames_reverse = frames[::-1].copy()
     height, width = frames.shape[1:3]
-    queries = _cache_queries(
+    initial_queries = _cache_queries(
         frame_count=len(frames),
         height=height,
         width=width,
         config=config,
     )
-    if not queries:
+    if not initial_queries:
         raise ValueError("No cache query points were generated")
 
     tracker = CoTrackerBackend(
@@ -157,31 +366,116 @@ def build_cotracker_cache(
         hub_model=config.hub_model,
         visibility_threshold=config.visibility_threshold,
     )
-    bundle = tracker.track(frames_reverse, queries)
-    bundle.validate(len(frames), len(queries))
+    threshold = _abort_threshold(config)
+    all_queries: list[QueryPoint] = []
+    all_parent_ids: list[int] = []
+    all_generation_indices: list[int] = []
+    all_abort_times: list[int] = []
+    bundles: list[TrackingBundle] = []
 
-    point_ids = np.arange(len(queries), dtype=np.int64)
-    birth_reverse_times = np.array([query.reverse_time for query in queries], dtype=np.int32)
-    seed_xy = np.array([[query.x, query.y] for query in queries], dtype=np.float32)
+    current_queries = initial_queries
+    current_parent_ids = [-1] * len(current_queries)
+    generation_index = 0
+    next_point_id = len(current_queries)
+    while current_queries:
+        generation_started = time.monotonic()
+        print(
+            f"confidence-refresh generation {generation_index}: "
+            f"tracking {len(current_queries)} point(s)",
+            flush=True,
+        )
+        bundle = tracker.track(frames_reverse, current_queries)
+        bundle.validate(len(frames), len(current_queries))
+        abort_times = _first_abort_times(
+            bundle,
+            current_queries,
+            threshold=threshold,
+        )
+
+        bundles.append(bundle)
+        all_queries.extend(current_queries)
+        all_parent_ids.extend(current_parent_ids)
+        all_generation_indices.extend([generation_index] * len(current_queries))
+        all_abort_times.extend(int(value) for value in abort_times)
+
+        next_queries: list[QueryPoint] = []
+        next_parent_ids: list[int] = []
+        for query_index, abort_t in enumerate(abort_times):
+            if abort_t < 0:
+                continue
+            if config.max_query_points > 0 and len(all_queries) + len(next_queries) >= config.max_query_points:
+                break
+            x, y = _refresh_birth_xy(
+                bundle,
+                current_queries[query_index],
+                query_index,
+                int(abort_t),
+                height=height,
+                width=width,
+            )
+            next_queries.append(
+                QueryPoint(
+                    id=next_point_id,
+                    reverse_time=int(abort_t),
+                    x=x,
+                    y=y,
+                    side=0,
+                    source="cotracker_cache_confidence_refresh",
+                )
+            )
+            next_parent_ids.append(int(current_queries[query_index].id))
+            next_point_id += 1
+
+        _truncate_bundle_at_aborts(bundle, abort_times)
+        elapsed = time.monotonic() - generation_started
+        print(
+            f"confidence-refresh generation {generation_index}: "
+            f"aborted={int(np.count_nonzero(abort_times >= 0))} "
+            f"created={len(next_queries)} "
+            f"threshold={threshold:.3f} elapsed={_format_duration(elapsed)}",
+            flush=True,
+        )
+        current_queries = next_queries
+        current_parent_ids = next_parent_ids
+        generation_index += 1
+
+    tracks = np.concatenate([bundle.tracks.astype(np.float32) for bundle in bundles], axis=1)
+    visibility = np.concatenate([bundle.visibility.astype(bool) for bundle in bundles], axis=1)
+    confidence = (
+        np.concatenate([bundle.confidence.astype(np.float32) for bundle in bundles], axis=1)
+        if all(bundle.confidence is not None for bundle in bundles)
+        else None
+    )
+    confidence_components = _concat_confidence_components(bundles)
+
+    point_ids = np.array([query.id for query in all_queries], dtype=np.int64)
+    birth_reverse_times = np.array([query.reverse_time for query in all_queries], dtype=np.int32)
+    seed_xy = np.array([[query.x, query.y] for query in all_queries], dtype=np.float32)
     source_birth_frames = np.array(
-        [frame_end - 1 - query.reverse_time for query in queries],
+        [frame_end - 1 - query.reverse_time for query in all_queries],
         dtype=np.int32,
     )
+    parent_point_ids = np.array(all_parent_ids, dtype=np.int64)
+    generation_indices = np.array(all_generation_indices, dtype=np.int16)
+    abort_reverse_times = np.array(all_abort_times, dtype=np.int32)
 
     arrays = {
-        "tracks": _write_array(output_dir / "tracks_reverse.npy", bundle.tracks.astype(np.float32)),
-        "visibility": _write_array(output_dir / "visibility_reverse.npy", bundle.visibility.astype(bool)),
+        "tracks": _write_array(output_dir / "tracks_reverse.npy", tracks.astype(np.float32)),
+        "visibility": _write_array(output_dir / "visibility_reverse.npy", visibility.astype(bool)),
         "point_ids": _write_array(output_dir / "point_ids.npy", point_ids),
         "birth_reverse_times": _write_array(output_dir / "birth_reverse_times.npy", birth_reverse_times),
         "source_birth_frames": _write_array(output_dir / "source_birth_frames.npy", source_birth_frames),
         "seed_xy": _write_array(output_dir / "seed_xy.npy", seed_xy),
+        "parent_point_ids": _write_array(output_dir / "parent_point_ids.npy", parent_point_ids),
+        "generation_indices": _write_array(output_dir / "generation_indices.npy", generation_indices),
+        "abort_reverse_times": _write_array(output_dir / "abort_reverse_times.npy", abort_reverse_times),
     }
-    if bundle.confidence is not None:
+    if confidence is not None:
         arrays["confidence"] = _write_array(
             output_dir / "confidence_reverse.npy",
-            bundle.confidence.astype(np.float32),
+            confidence.astype(np.float32),
         )
-    for name, component in bundle.confidence_components.items():
+    for name, component in confidence_components.items():
         arrays[f"confidence_component_{name}"] = _write_array(
             output_dir / f"{name}_reverse.npy",
             component.astype(np.float32),
@@ -189,19 +483,29 @@ def build_cotracker_cache(
 
     metadata = {
         "schema": CACHE_SCHEMA,
+        "coverage_model": "dense_confidence_refresh",
         "source_root": str(source_root),
         "frame_start": int(config.frame_start),
         "frame_end": int(frame_end),
         "frame_count": int(frame_end - config.frame_start),
         "width": int(width),
         "height": int(height),
-        "point_count": int(len(queries)),
+        "point_count": int(len(all_queries)),
+        "initial_point_count": int(len(initial_queries)),
+        "refresh_birth_count": int(len(all_queries) - len(initial_queries)),
+        "refresh_generation_count": int(generation_index),
+        "abort_confidence_threshold": threshold,
         "config": asdict(config),
-        "tracker": bundle.tracker.to_json(),
+        "tracker": bundles[0].tracker.to_json(),
         "arrays": arrays,
         "time_order": {
             "tracks_reverse": "cache frame 0 is source frame frame_end - 1",
             "source_frame_for_reverse_t": "source_frame = frame_end - 1 - reverse_t",
+            "birth_rule": (
+                "initial raw dense IDs are born on reverse frame 0; child IDs are born only "
+                "when their parent first falls below the confidence/visibility threshold"
+            ),
+            "refresh_birth_xy": "abort-frame track coordinate, falling back to previous finite coordinate then seed",
         },
     }
     (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -257,7 +561,15 @@ def _cache_metadata_matches(path: Path, *, frame_start: int, frame_end: int, con
     if int(metadata.get("frame_end", -1)) != int(frame_end):
         return False
     existing = metadata.get("config", {})
-    for key in ("grid_stride", "region", "query_mode", "query_frame_stride", "max_query_points"):
+    for key in (
+        "grid_stride",
+        "region",
+        "query_mode",
+        "query_frame_stride",
+        "max_query_points",
+        "visibility_threshold",
+        "abort_confidence_threshold",
+    ):
         if existing.get(key) != getattr(config, key):
             return False
     arrays = metadata.get("arrays", {})
@@ -381,6 +693,21 @@ class CoTrackerCache:
             mmap_mode=mmap_mode,
         )
         self.seed_xy = np.load(self.root / arrays["seed_xy"], mmap_mode=mmap_mode)
+        self.parent_point_ids = (
+            np.load(self.root / arrays["parent_point_ids"], mmap_mode=mmap_mode)
+            if "parent_point_ids" in arrays
+            else np.full(self.point_ids.shape, -1, dtype=np.int64)
+        )
+        self.generation_indices = (
+            np.load(self.root / arrays["generation_indices"], mmap_mode=mmap_mode)
+            if "generation_indices" in arrays
+            else np.zeros(self.point_ids.shape, dtype=np.int16)
+        )
+        self.abort_reverse_times = (
+            np.load(self.root / arrays["abort_reverse_times"], mmap_mode=mmap_mode)
+            if "abort_reverse_times" in arrays
+            else np.full(self.point_ids.shape, -1, dtype=np.int32)
+        )
         self.confidence = (
             np.load(self.root / arrays["confidence"], mmap_mode=mmap_mode)
             if "confidence" in arrays
@@ -637,6 +964,13 @@ class CachedCoTrackerBackend:
         cache_point_ids = np.full(len(queries), -1, dtype=np.int64)
         if ok.any():
             cache_point_ids[ok] = np.asarray(cache.point_ids[matched[ok]], dtype=np.int64)
+        cache_parent_point_ids = np.full(len(queries), -1, dtype=np.int64)
+        cache_generation_indices = np.full(len(queries), -1, dtype=np.int16)
+        cache_abort_reverse_times = np.full(len(queries), -1, dtype=np.int32)
+        if ok.any():
+            cache_parent_point_ids[ok] = np.asarray(cache.parent_point_ids[matched[ok]], dtype=np.int64)
+            cache_generation_indices[ok] = np.asarray(cache.generation_indices[matched[ok]], dtype=np.int16)
+            cache_abort_reverse_times[ok] = np.asarray(cache.abort_reverse_times[matched[ok]], dtype=np.int32)
 
         chunk_id = chunk.chunk_id if chunk is not None else cache.root.name
         chunk_index = chunk.chunk_index if chunk is not None else 0
@@ -667,6 +1001,9 @@ class CachedCoTrackerBackend:
             extra_arrays={
                 "cache_point_ids": cache_point_ids,
                 "cache_point_indices": matched.astype(np.int64),
+                "cache_parent_point_ids": cache_parent_point_ids,
+                "cache_generation_indices": cache_generation_indices,
+                "cache_abort_reverse_times": cache_abort_reverse_times,
                 "cache_chunk_indices": cache_chunk_indices,
                 "cache_chunk_ids": cache_chunk_ids,
                 "cache_unique_point_ids": unique_ids,

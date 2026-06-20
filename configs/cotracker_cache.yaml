@@ -1,0 +1,25 @@
+# CoTracker cache generation settings.
+# The runner reads this file; edit values here instead of adding cache knobs to scripts.
+
+chunk:
+  size: 480
+  window_size: 80
+  step:
+
+cache:
+  grid_stride: 1
+  region: bottom-third
+  query_mode: confidence-refresh
+  query_frame_stride: 1
+  max_query_points: 0
+
+  # A track becomes "bad" below this confidence and gets aborted/replaced.
+  bad_track_confidence_threshold: 0.9
+
+tracker:
+  device: cuda
+  batch_size: 256
+  hub_repo: facebookresearch/co-tracker
+  hub_model: cotracker3_offline
+  visibility_threshold: 0.9
+  torch_home:

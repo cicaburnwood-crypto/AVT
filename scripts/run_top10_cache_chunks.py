@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 CHUNKED_CACHE_SCHEMA = "avt_cotracker_chunked_cache_v1"
+DEFAULT_CACHE_CONFIG = REPO_ROOT / "configs" / "cotracker_cache.yaml"
 
 
 @dataclass(frozen=True)
@@ -221,7 +222,7 @@ def prepare_frames(
     return written
 
 
-def _manifest_ready(cache_dir: Path, *, chunk_size: int, window_size: int) -> bool:
+def _manifest_ready(cache_dir: Path, *, cache_config) -> bool:
     manifest_path = cache_dir / "manifest.json"
     if not manifest_path.exists():
         return False
@@ -231,8 +232,10 @@ def _manifest_ready(cache_dir: Path, *, chunk_size: int, window_size: int) -> bo
         return False
     return (
         manifest.get("schema") == CHUNKED_CACHE_SCHEMA
-        and int(manifest.get("chunk_size", -1)) == int(chunk_size)
-        and int(manifest.get("window_size", -1)) == int(window_size)
+        and int(manifest.get("chunk_size", -1)) == int(cache_config.chunk_size)
+        and int(manifest.get("window_size", -1)) == int(cache_config.window_size)
+        and int(manifest.get("chunk_step", -1)) == int(cache_config.resolved_chunk_step)
+        and manifest.get("cache_config") == asdict(cache_config.cache)
         and bool(manifest.get("chunks"))
     )
 
@@ -242,18 +245,15 @@ def build_cache(
     frames_dir: Path,
     cache_dir: Path,
     args: argparse.Namespace,
+    cache_config,
 ) -> dict[str, Any]:
     from avt.io import read_frame_records
-    from avt.tracking.cotracker_cache import (
-        CoTrackerCacheConfig,
-        CoTrackerChunkCacheConfig,
-        build_cotracker_cache_chunks,
-    )
+    from avt.tracking.cotracker_cache import build_cotracker_cache_chunks
 
     if args.force_cache and cache_dir.exists():
         shutil.rmtree(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
-    if _manifest_ready(cache_dir, chunk_size=args.cache_chunk_size, window_size=args.cache_window_size):
+    if _manifest_ready(cache_dir, cache_config=cache_config):
         manifest = json.loads((cache_dir / "manifest.json").read_text(encoding="utf-8"))
         print(f"chunk cache ready: {cache_dir} ({len(manifest['chunks'])} chunks)", flush=True)
         return manifest
@@ -264,24 +264,7 @@ def build_cache(
         frame_records=records,
         output_dir=cache_dir,
         resume=True,
-        config=CoTrackerChunkCacheConfig(
-            chunk_size=args.cache_chunk_size,
-            window_size=args.cache_window_size,
-            chunk_step=args.cache_chunk_step,
-            cache=CoTrackerCacheConfig(
-                grid_stride=args.cache_grid_stride,
-                region=args.cache_region,
-                query_mode=args.cache_query_mode,
-                query_frame_stride=args.cache_query_frame_stride,
-                max_query_points=args.cache_max_query_points,
-                device=args.cotracker_device,
-                batch_size=args.cotracker_batch_size,
-                torch_home=args.torch_home,
-                hub_repo=args.cotracker_hub_repo,
-                hub_model=args.cotracker_hub_model,
-                visibility_threshold=args.cotracker_visibility_threshold,
-            ),
-        ),
+        config=cache_config,
     )
 
 
@@ -291,14 +274,19 @@ def _tasks(camera: str) -> list[tuple[TopRide, str]]:
 
 
 def run(args: argparse.Namespace) -> int:
+    from avt.tracking.cotracker_cache import load_cotracker_cache_config_yaml
+
     data_root = args.data_root.resolve()
     prepared_root = args.prepared_root.resolve()
     output_root = args.output_root.resolve()
+    cache_config_path = args.cache_config.resolve()
+    cache_config = load_cotracker_cache_config_yaml(cache_config_path)
     output_root.mkdir(parents=True, exist_ok=True)
     args_payload = {
         key: str(value) if isinstance(value, Path) else value
         for key, value in vars(args).items()
     }
+    args_payload["cache_config_values"] = asdict(cache_config)
     selected = _tasks(args.camera)
     if args.limit_videos is not None:
         selected = selected[: args.limit_videos]
@@ -307,8 +295,9 @@ def run(args: argparse.Namespace) -> int:
     run_started = time.monotonic()
     completed: list[dict[str, Any]] = []
     print(
-        f"starting {len(selected)} cache task(s), chunk={args.cache_chunk_size}, "
-        f"window={args.cache_window_size}, region={args.cache_region}",
+        f"starting {len(selected)} cache task(s), chunk={cache_config.chunk_size}, "
+        f"window={cache_config.window_size}, region={cache_config.cache.region}, "
+        f"bad_track_confidence_threshold={cache_config.cache.abort_confidence_threshold}",
         flush=True,
     )
 
@@ -319,7 +308,7 @@ def run(args: argparse.Namespace) -> int:
         uid = _camera_uid(camera)
         stem = f"{ride.rank:02d}_{ride.asset}_{camera}_uid{uid}"
         frames_dir = prepared_root / f"{stem}_frames"
-        cache_dir = output_root / f"{stem}_chunks{args.cache_chunk_size}_w{args.cache_window_size}"
+        cache_dir = output_root / f"{stem}_chunks{cache_config.chunk_size}_w{cache_config.window_size}"
 
         print(f"[{ordinal}/{len(selected)}] {ride.asset} {camera}: preparing frames", flush=True)
         frame_count = prepare_frames(
@@ -331,7 +320,12 @@ def run(args: argparse.Namespace) -> int:
         )
 
         print(f"[{ordinal}/{len(selected)}] {ride.asset} {camera}: building cache", flush=True)
-        manifest = build_cache(frames_dir=frames_dir, cache_dir=cache_dir, args=args)
+        manifest = build_cache(
+            frames_dir=frames_dir,
+            cache_dir=cache_dir,
+            args=args,
+            cache_config=cache_config,
+        )
         task_elapsed = time.monotonic() - task_started
         completed.append(
             {
@@ -380,28 +374,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frames", type=int, default=None, help="Debug limit for each prepared video.")
     parser.add_argument("--force-prepare", action="store_true")
     parser.add_argument("--force-cache", action="store_true")
-    parser.add_argument("--cache-chunk-size", type=int, default=480)
-    parser.add_argument("--cache-window-size", type=int, default=80)
-    parser.add_argument("--cache-chunk-step", type=int, default=None)
-    parser.add_argument("--cache-grid-stride", type=int, default=8)
     parser.add_argument(
-        "--cache-region",
-        choices=("full", "bottom-third", "bottom-half"),
-        default="bottom-third",
+        "--cache-config",
+        type=Path,
+        default=DEFAULT_CACHE_CONFIG,
+        help=f"YAML file for CoTracker cache settings. Default: {DEFAULT_CACHE_CONFIG}",
     )
-    parser.add_argument(
-        "--cache-query-mode",
-        choices=("last-frame", "every-frame"),
-        default="last-frame",
-    )
-    parser.add_argument("--cache-query-frame-stride", type=int, default=1)
-    parser.add_argument("--cache-max-query-points", type=int, default=0)
-    parser.add_argument("--cotracker-device", default="cuda")
-    parser.add_argument("--cotracker-batch-size", type=int, default=256)
-    parser.add_argument("--cotracker-hub-repo", default="facebookresearch/co-tracker")
-    parser.add_argument("--cotracker-hub-model", default="cotracker3_offline")
-    parser.add_argument("--cotracker-visibility-threshold", type=float, default=0.9)
-    parser.add_argument("--torch-home", default=None)
     return parser
 
 

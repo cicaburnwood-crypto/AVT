@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -24,6 +25,32 @@ class CoTrackerBackend:
     hub_repo: str = "facebookresearch/co-tracker"
     hub_model: str = "cotracker3_offline"
     visibility_threshold: float = 0.9
+    _model: Any = field(default=None, init=False, repr=False)
+    _model_device: str | None = field(default=None, init=False, repr=False)
+
+    def _resolve_device(self, torch) -> str:
+        device = "cuda" if self.device == "auto" and torch.cuda.is_available() else self.device
+        if device == "auto":
+            device = "cpu"
+        return str(device)
+
+    def _load_model(self, torch, device: str):
+        if self._model is not None and self._model_device == device:
+            return self._model
+        try:
+            self._model = torch.hub.load(
+                self.hub_repo,
+                self.hub_model,
+                trust_repo=True,
+            ).to(device)
+        except Exception as exc:  # pragma: no cover - depends on local cache/network
+            raise RuntimeError(
+                "Could not load CoTracker. Install/cache CoTracker or use "
+                "--backend lk / a custom PointTracker."
+            ) from exc
+        self._model.eval()
+        self._model_device = device
+        return self._model
 
     def _track_batch_with_public_api(self, model, video, batch, torch) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
         outputs = model(video, queries=batch)
@@ -166,27 +193,14 @@ class CoTrackerBackend:
             os.environ.setdefault("TORCH_HOME", self.torch_home)
             Path(self.torch_home).mkdir(parents=True, exist_ok=True)
 
-        device = "cuda" if self.device == "auto" and torch.cuda.is_available() else self.device
-        if device == "auto":
-            device = "cpu"
+        device = self._resolve_device(torch)
         is_cuda_device = str(device).startswith("cuda")
 
         video = torch.from_numpy(frames_rgb).permute(0, 3, 1, 2)[None].float().to(device)
         query_rows = [[q.reverse_time, q.x, q.y] for q in queries]
         query_tensor = torch.tensor(query_rows, dtype=torch.float32, device=device)
 
-        try:
-            model = torch.hub.load(
-                self.hub_repo,
-                self.hub_model,
-                trust_repo=True,
-            ).to(device)
-        except Exception as exc:  # pragma: no cover - depends on local cache/network
-            raise RuntimeError(
-                "Could not load CoTracker. Install/cache CoTracker or use "
-                "--backend lk / a custom PointTracker."
-            ) from exc
-        model.eval()
+        model = self._load_model(torch, device)
 
         track_batches: list[np.ndarray] = []
         visibility_batches: list[np.ndarray] = []

@@ -41,10 +41,13 @@ from avt.tracking.cotracker_cache import (
     CHUNKED_CACHE_SCHEMA,
     CachedCoTrackerBackend,
     CACHE_SCHEMA,
+    CoTrackerCacheConfig,
+    cotracker_cache_config_from_mapping,
+    _cache_queries,
 )
 from avt.tracking.foundationpose import FoundationPoseBackend
 from avt.tracking.foundationpose.download import FOUNDATIONPOSE_WEIGHT_FILES
-from avt.viewer import build_viewer
+from avt.viewer import build_viewer, write_viewer
 
 
 class FakeTracker:
@@ -284,13 +287,21 @@ def test_cli_accepts_cotracker_cache_backend() -> None:
             "/tmp/frames",
             "--cache-frame-count",
             "100",
-            "--cache-grid-stride",
-            "16",
             "--cache-query-mode",
-            "every-frame",
+            "confidence-refresh",
+            "--cache-config",
+            "configs/cotracker_cache.yaml",
         ]
     )
-    chunk_args = parser.parse_args(["cache-chunks", "--frames-root", "/tmp/frames"])
+    chunk_args = parser.parse_args(
+        [
+            "cache-chunks",
+            "--frames-root",
+            "/tmp/frames",
+            "--cache-config",
+            "configs/cotracker_cache.yaml",
+        ]
+    )
     track_args = parser.parse_args(
         [
             "track",
@@ -305,14 +316,61 @@ def test_cli_accepts_cotracker_cache_backend() -> None:
     )
 
     assert cache_args.cache_frame_count == 100
-    assert cache_args.cache_grid_stride == 16
-    assert cache_args.cache_query_mode == "every-frame"
+    assert cache_args.cache_config == Path("configs/cotracker_cache.yaml")
+    assert cache_args.cache_grid_stride == 1
+    assert cache_args.cache_query_mode == "confidence-refresh"
     assert chunk_args.cache_chunk_size == 480
     assert chunk_args.cache_window_size == 80
     assert chunk_args.cache_chunk_step is None
+    assert chunk_args.cache_grid_stride == 1
+    assert chunk_args.cache_region == "bottom-third"
+    assert chunk_args.cache_query_mode == "confidence-refresh"
+    assert chunk_args.cache_config == Path("configs/cotracker_cache.yaml")
     assert track_args.backend == "cotracker_cache"
     assert track_args.cotracker_cache == Path("/tmp/cache")
     assert track_args.cache_record_ids_only is True
+
+
+def test_cotracker_cache_queries_seed_initial_dense_frame_by_default() -> None:
+    config = CoTrackerCacheConfig(region="bottom-half")
+
+    queries = _cache_queries(frame_count=3, height=4, width=3, config=config)
+
+    assert config.query_mode == "confidence-refresh"
+    assert [query.reverse_time for query in queries] == [0, 0, 0, 0, 0, 0]
+    assert [query.id for query in queries] == list(range(6))
+
+
+def test_cotracker_cache_config_from_yaml_mapping() -> None:
+    config = cotracker_cache_config_from_mapping(
+        {
+            "chunk": {
+                "size": 120,
+                "window_size": 80,
+                "step": 40,
+            },
+            "cache": {
+                "region": "bottom-half",
+                "bad_track_confidence_threshold": 0.72,
+            },
+            "tracker": {
+                "device": "cpu",
+                "batch_size": 32,
+                "visibility_threshold": 0.80,
+            },
+        }
+    )
+
+    assert config.chunk_size == 120
+    assert config.window_size == 80
+    assert config.chunk_step == 40
+    assert config.cache.grid_stride == 1
+    assert config.cache.region == "bottom-half"
+    assert config.cache.query_mode == "confidence-refresh"
+    assert config.cache.abort_confidence_threshold == 0.72
+    assert config.cache.visibility_threshold == 0.80
+    assert config.cache.device == "cpu"
+    assert config.cache.batch_size == 32
 
 
 def test_bootstap_config_from_mapping() -> None:
@@ -443,7 +501,7 @@ def write_synthetic_cotracker_cache(
         "width": 64,
         "height": 48,
         "point_count": len(point_ids),
-        "config": {"grid_stride": 16, "region": "full", "query_mode": "last-frame"},
+        "config": {"grid_stride": 1, "region": "full", "query_mode": "confidence-refresh"},
         "tracker": {"name": "cotracker"},
         "arrays": {
             "tracks": "tracks_reverse.npy",
@@ -604,6 +662,24 @@ def test_foundationpose_transform_directory_uses_window_context(tmp_path: Path) 
     bundle = tracker.track(frames, queries)
 
     assert bundle.tracks[:, 0, 1].tolist() == [6, 7, 8]
+
+
+def test_write_viewer_serializes_nonfinite_numbers_as_null(tmp_path: Path) -> None:
+    write_viewer(
+        tmp_path,
+        {
+            "metadata": {"bad_float": float("nan")},
+            "frames": [],
+            "windows": [{"bad_numpy_float": np.float32(np.inf)}],
+        },
+    )
+
+    text = (tmp_path / "data" / "prediction_tracks.json").read_text(encoding="utf-8")
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    payload = json.loads(text)
+    assert payload["metadata"]["bad_float"] is None
+    assert payload["windows"][0]["bad_numpy_float"] is None
 
 
 def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:

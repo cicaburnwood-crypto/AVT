@@ -15,6 +15,7 @@ from .viewer import build_viewer
 DEFAULT_OUTPUT_ROOT = Path(__file__).resolve().parents[1] / "outputs"
 DEFAULT_VIEWER_ROOT = DEFAULT_OUTPUT_ROOT / "viewer_runs"
 DEFAULT_CACHE_ROOT = DEFAULT_OUTPUT_ROOT / "cotracker_caches"
+DEFAULT_CACHE_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "cotracker_cache.yaml"
 DEFAULT_WINDOW_SIZE = 80
 DEFAULT_CACHE_CHUNK_SIZE = 480
 DEFAULT_CACHE_WINDOW_SIZE = 80
@@ -199,15 +200,20 @@ def _tracker_from_args(args: argparse.Namespace):
 
 
 def cmd_cache(args: argparse.Namespace) -> int:
-    from .tracking.cotracker_cache import CoTrackerCacheConfig, build_cotracker_cache
+    from .tracking.cotracker_cache import (
+        CoTrackerCacheConfig,
+        build_cotracker_cache,
+        load_cotracker_cache_config_yaml,
+    )
 
     records = read_frame_records(args.frames_root, args.source_type)
     output_root = _create_unique_run_dir(args.output_root)
-    metadata = build_cotracker_cache(
-        source_root=args.frames_root,
-        frame_records=records,
-        output_dir=output_root,
-        config=CoTrackerCacheConfig(
+    if args.cache_config is not None:
+        cache_config = load_cotracker_cache_config_yaml(args.cache_config).cache
+        cache_config.frame_start = args.cache_frame_start
+        cache_config.frame_count = args.cache_frame_count
+    else:
+        cache_config = CoTrackerCacheConfig(
             frame_start=args.cache_frame_start,
             frame_count=args.cache_frame_count,
             grid_stride=args.cache_grid_stride,
@@ -221,7 +227,13 @@ def cmd_cache(args: argparse.Namespace) -> int:
             hub_repo=args.cotracker_hub_repo,
             hub_model=args.cotracker_hub_model,
             visibility_threshold=args.cotracker_visibility_threshold,
-        ),
+            abort_confidence_threshold=args.cache_abort_confidence_threshold,
+        )
+    metadata = build_cotracker_cache(
+        source_root=args.frames_root,
+        frame_records=records,
+        output_dir=output_root,
+        config=cache_config,
     )
     print(
         json.dumps(
@@ -245,16 +257,15 @@ def cmd_cache_chunks(args: argparse.Namespace) -> int:
         CoTrackerCacheConfig,
         CoTrackerChunkCacheConfig,
         build_cotracker_cache_chunks,
+        load_cotracker_cache_config_yaml,
     )
 
     records = read_frame_records(args.frames_root, args.source_type)
     output_root = _create_unique_run_dir(args.output_root)
-    manifest = build_cotracker_cache_chunks(
-        source_root=args.frames_root,
-        frame_records=records,
-        output_dir=output_root,
-        resume=bool(args.cache_resume),
-        config=CoTrackerChunkCacheConfig(
+    if args.cache_config is not None:
+        cache_config = load_cotracker_cache_config_yaml(args.cache_config)
+    else:
+        cache_config = CoTrackerChunkCacheConfig(
             chunk_size=args.cache_chunk_size,
             window_size=args.cache_window_size,
             chunk_step=args.cache_chunk_step,
@@ -272,8 +283,15 @@ def cmd_cache_chunks(args: argparse.Namespace) -> int:
                 hub_repo=args.cotracker_hub_repo,
                 hub_model=args.cotracker_hub_model,
                 visibility_threshold=args.cotracker_visibility_threshold,
+                abort_confidence_threshold=args.cache_abort_confidence_threshold,
             ),
-        ),
+        )
+    manifest = build_cotracker_cache_chunks(
+        source_root=args.frames_root,
+        frame_records=records,
+        output_dir=output_root,
+        resume=bool(args.cache_resume),
+        config=cache_config,
     )
     print(
         json.dumps(
@@ -501,19 +519,40 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cache.add_argument("--cache-frame-start", type=int, default=0)
     cache.add_argument("--cache-frame-count", type=int, default=None)
-    cache.add_argument("--cache-grid-stride", type=int, default=8)
+    cache.add_argument(
+        "--cache-config",
+        type=Path,
+        default=None,
+        help=(
+            "Optional YAML file for cache settings. When provided, cache tuning "
+            "comes from YAML; frame start/count still come from CLI."
+        ),
+    )
+    cache.add_argument(
+        "--cache-grid-stride",
+        type=int,
+        choices=(1,),
+        default=1,
+        help="Raw dense pixel spacing inside the selected cache region. Only 1 is supported.",
+    )
     cache.add_argument(
         "--cache-region",
         choices=("full", "bottom-third", "bottom-half"),
-        default="full",
+        default="bottom-third",
     )
     cache.add_argument(
         "--cache-query-mode",
-        choices=("last-frame", "every-frame"),
-        default="last-frame",
-        help="Seed grid points once at reverse frame 0 or at every reverse frame.",
+        choices=("confidence-refresh",),
+        default="confidence-refresh",
+        help="Seed raw dense points once, then create child IDs only when confidence aborts.",
     )
-    cache.add_argument("--cache-query-frame-stride", type=int, default=1)
+    cache.add_argument("--cache-query-frame-stride", type=int, choices=(1,), default=1)
+    cache.add_argument(
+        "--cache-abort-confidence-threshold",
+        type=float,
+        default=None,
+        help="Confidence below this aborts an ID. Defaults to --cotracker-visibility-threshold.",
+    )
     cache.add_argument(
         "--cache-max-query-points",
         type=int,
@@ -547,18 +586,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Frame step between chunks. Defaults to chunk_size - window_size.",
     )
-    cache_chunks.add_argument("--cache-grid-stride", type=int, default=8)
+    cache_chunks.add_argument(
+        "--cache-config",
+        type=Path,
+        default=None,
+        help=f"Optional YAML file for cache settings, for example {DEFAULT_CACHE_CONFIG}.",
+    )
+    cache_chunks.add_argument(
+        "--cache-grid-stride",
+        type=int,
+        choices=(1,),
+        default=1,
+        help="Raw dense pixel spacing inside the selected cache region. Only 1 is supported.",
+    )
     cache_chunks.add_argument(
         "--cache-region",
         choices=("full", "bottom-third", "bottom-half"),
-        default="full",
+        default="bottom-third",
     )
     cache_chunks.add_argument(
         "--cache-query-mode",
-        choices=("last-frame", "every-frame"),
-        default="last-frame",
+        choices=("confidence-refresh",),
+        default="confidence-refresh",
     )
-    cache_chunks.add_argument("--cache-query-frame-stride", type=int, default=1)
+    cache_chunks.add_argument("--cache-query-frame-stride", type=int, choices=(1,), default=1)
+    cache_chunks.add_argument(
+        "--cache-abort-confidence-threshold",
+        type=float,
+        default=None,
+        help="Confidence below this aborts an ID. Defaults to --cotracker-visibility-threshold.",
+    )
     cache_chunks.add_argument(
         "--cache-max-query-points",
         type=int,

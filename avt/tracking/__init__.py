@@ -6,6 +6,8 @@ from .cotracker_cache import (
     CoTrackerChunkCacheConfig,
     CoTrackerChunkedCacheIndex,
     build_cotracker_cache_chunks,
+    cotracker_cache_config_from_mapping,
+    load_cotracker_cache_config_yaml,
 )
 from .lk import LKTracker
 
@@ -19,4 +21,6 @@ __all__ = [
     "TrackingBundle",
     "LKTracker",
     "build_cotracker_cache_chunks",
+    "cotracker_cache_config_from_mapping",
+    "load_cotracker_cache_config_yaml",
 ]

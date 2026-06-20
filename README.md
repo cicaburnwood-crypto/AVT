@@ -72,13 +72,9 @@ parameters.
 avt cache \
   --frames-root /path/to/images \
   --source-type image_dir \
+  --cache-config configs/cotracker_cache.yaml \
   --cache-frame-start 0 \
   --cache-frame-count 100 \
-  --cache-grid-stride 8 \
-  --cache-region full \
-  --cache-query-mode last-frame \
-  --cotracker-device cuda \
-  --cotracker-batch-size 1024
 ```
 
 The command writes a reusable cache directory under `outputs/cotracker_caches`
@@ -92,20 +88,15 @@ cache:
 avt cache-chunks \
   --frames-root /path/to/images \
   --source-type image_dir \
-  --cache-chunk-size 480 \
-  --cache-window-size 80 \
-  --cache-grid-stride 8 \
-  --cache-region bottom-third \
-  --cache-query-mode last-frame \
-  --cotracker-device cuda \
-  --cotracker-batch-size 1024
+  --cache-config configs/cotracker_cache.yaml
 ```
 
-`cache-chunks` defaults to `--cache-chunk-size 480` and
-`--cache-window-size 80`. If `--cache-chunk-step` is omitted it uses
-`chunk_size - window_size`, so the default step is 400 frames and every
-80-frame extraction window can fit inside at least one cache chunk. Chunks are
-not merged and do not share point identity.
+`cache-chunks` reads chunk size, extraction window size, chunk step, CoTracker
+runtime settings, and `bad_track_confidence_threshold` from
+`configs/cotracker_cache.yaml`. If `chunk.step` is omitted it uses
+`chunk.size - chunk.window_size`, so the default YAML step is 400 frames and
+every 80-frame extraction window can fit inside at least one cache chunk.
+Chunks are not merged and do not share point identity.
 
 Then extract AVT windows from the cache:
 
@@ -157,13 +148,12 @@ In ID-only mode `tracks.npz` stores arrays such as `cache_point_ids`,
 `cache_unique_point_ids` when IDs need to be unique across chunked caches. The
 viewer can materialize those tracks from the referenced cache later.
 
-Cache query modes:
+Cache query mode:
 
-- `last-frame`: seed the grid once on reverse frame 0, matching the "track from
-  the last frame backward" flow.
-- `every-frame`: seed the grid repeatedly through reverse time. This records
-  possible replacement IDs for later frames without changing extractor
-  parameters, at the cost of a larger cache.
+- `confidence-refresh`: seed raw dense pixels once on reverse frame 0, check
+  confidence/visibility every frame, abort an ID at its first failed check, and
+  create one child ID at that abort frame. The cache does not grid-downsample
+  and does not create replacement IDs while the parent remains reliable.
 
 For the current top-10 ride cache batch, use the resumable runner:
 
@@ -172,12 +162,16 @@ python scripts/run_top10_cache_chunks.py \
   --data-root data \
   --prepared-root data/prepared_top10_cache \
   --output-root outputs/top10_cotracker_cache_chunks \
+  --cache-config configs/cotracker_cache.yaml \
   --camera front \
-  --cache-chunk-size 480 \
-  --cache-window-size 80
+  --limit-videos 2
 ```
 
 The runner prepares front-camera frames from the ride HLS playlists when needed
+and reads cache generation parameters from `configs/cotracker_cache.yaml`.
+Adjust chunk/window size, CoTracker runtime settings, and
+`bad_track_confidence_threshold` in that YAML file rather than adding cache
+knobs to the script.
 and then writes fixed chunk-cache directories, so reruns reuse completed frames
 and completed chunks. It does not run extraction or visualization.
 
