@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -206,8 +207,30 @@ class CoTrackerBackend:
         visibility_batches: list[np.ndarray] = []
         confidence_batches: list[np.ndarray] = []
         confidence_component_batches: dict[str, list[np.ndarray]] = {}
+        total_queries = len(queries)
+        total_batches = (total_queries + self.batch_size - 1) // self.batch_size
+        progress_started = time.monotonic()
+
+        def _fmt_duration(seconds: float) -> str:
+            seconds = max(0, int(round(seconds)))
+            hours, rem = divmod(seconds, 3600)
+            minutes, secs = divmod(rem, 60)
+            if hours:
+                return f"{hours}h{minutes:02d}m{secs:02d}s"
+            if minutes:
+                return f"{minutes}m{secs:02d}s"
+            return f"{secs}s"
+
         with torch.inference_mode():
-            for start in range(0, len(queries), self.batch_size):
+            for start in range(0, total_queries, self.batch_size):
+                batch_index = start // self.batch_size + 1
+                batch_count = min(self.batch_size, total_queries - start)
+                batch_started = time.monotonic()
+                print(
+                    f"cotracker batch {batch_index}/{total_batches}: start "
+                    f"queries={batch_count} total_queries={total_queries} batch_size={self.batch_size}",
+                    flush=True,
+                )
                 batch = query_tensor[start : start + self.batch_size][None]
                 batch_tracks, batch_visibility, batch_confidence, batch_components = self._track_batch(
                     model,
@@ -220,6 +243,25 @@ class CoTrackerBackend:
                 confidence_batches.append(batch_confidence)
                 for name, component in batch_components.items():
                     confidence_component_batches.setdefault(name, []).append(component)
+                batch_elapsed = time.monotonic() - batch_started
+                total_elapsed = time.monotonic() - progress_started
+                rate = batch_index / max(total_elapsed, 1e-6)
+                eta = (total_batches - batch_index) / rate if rate > 0 else 0.0
+                gpu_suffix = ""
+                if is_cuda_device:
+                    try:
+                        allocated = torch.cuda.memory_allocated(device) / (1024**3)
+                        reserved = torch.cuda.memory_reserved(device) / (1024**3)
+                        gpu_suffix = f" gpu_alloc={allocated:.1f}GiB gpu_reserved={reserved:.1f}GiB"
+                    except Exception:
+                        gpu_suffix = ""
+                print(
+                    f"cotracker batch {batch_index}/{total_batches}: done "
+                    f"batch_elapsed={_fmt_duration(batch_elapsed)} "
+                    f"total_elapsed={_fmt_duration(total_elapsed)} eta={_fmt_duration(eta)}"
+                    f"{gpu_suffix}",
+                    flush=True,
+                )
                 if is_cuda_device:
                     del batch, batch_tracks, batch_visibility, batch_confidence, batch_components
                     torch.cuda.empty_cache()

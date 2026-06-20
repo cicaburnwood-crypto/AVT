@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import time
 from typing import Any
+import gc
 
 import numpy as np
 
@@ -16,6 +17,7 @@ from .cotracker import CoTrackerBackend
 
 REGION_CHOICES = ("full", "bottom-third", "bottom-half")
 CACHE_SCHEMA = "avt_cotracker_cache_v1"
+SEGMENTED_CACHE_SCHEMA = "avt_cotracker_segmented_cache_v1"
 CHUNKED_CACHE_SCHEMA = "avt_cotracker_chunked_cache_v1"
 DEFAULT_CACHE_CHUNK_SIZE = 480
 DEFAULT_CACHE_WINDOW_SIZE = 80
@@ -37,6 +39,7 @@ class CoTrackerCacheConfig:
     hub_model: str = "cotracker3_offline"
     visibility_threshold: float = 0.9
     abort_confidence_threshold: float | None = None
+    max_track_frames: int = 0
 
 
 @dataclass
@@ -244,17 +247,45 @@ def _first_abort_times(
     queries: list[QueryPoint],
     *,
     threshold: float,
+    max_track_frames: int = 0,
 ) -> np.ndarray:
+    if max_track_frames < 0:
+        raise ValueError("max_track_frames must be non-negative")
     reliable = _reliable_mask(bundle, threshold=threshold)
     abort_times = np.full(len(queries), -1, dtype=np.int32)
     for idx, query in enumerate(queries):
-        start = int(query.reverse_time) + 1
+        birth_t = int(query.reverse_time)
+        start = birth_t + 1
         if start >= reliable.shape[0]:
             continue
-        failed = np.flatnonzero(~reliable[start:, idx])
+        check_end = reliable.shape[0]
+        if max_track_frames > 0:
+            check_end = min(check_end, birth_t + int(max_track_frames))
+        if start < check_end:
+            failed = np.flatnonzero(~reliable[start:check_end, idx])
+        else:
+            failed = np.array([], dtype=np.int64)
         if failed.size:
             abort_times[idx] = int(start + failed[0])
+        elif max_track_frames > 0 and check_end < reliable.shape[0]:
+            abort_times[idx] = int(check_end)
     return abort_times
+
+
+def _refresh_offset_summary(queries: list[QueryPoint], refresh_times: np.ndarray) -> str:
+    offsets = [
+        int(refresh_t) - int(query.reverse_time)
+        for query, refresh_t in zip(queries, refresh_times)
+        if int(refresh_t) >= 0
+    ]
+    if not offsets:
+        return "refresh_offsets=none"
+    values = np.array(offsets, dtype=np.float32)
+    p50, p90, p99 = np.percentile(values, [50, 90, 99])
+    return (
+        f"refresh_offsets=min:{int(values.min())} "
+        f"p50:{p50:.0f} p90:{p90:.0f} p99:{p99:.0f} max:{int(values.max())}"
+    )
 
 
 def _clamp_xy(xy: np.ndarray, *, height: int, width: int) -> tuple[float, float]:
@@ -318,6 +349,147 @@ def _write_array(path: Path, array: np.ndarray) -> str:
     return path.name
 
 
+def _write_relative_array(root: Path, path: Path, array: np.ndarray) -> str:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(path, array)
+    return str(path.relative_to(root))
+
+
+def _write_segmented_metadata(
+    output_dir: Path,
+    *,
+    source_root: Path,
+    frame_start: int,
+    frame_end: int,
+    width: int,
+    height: int,
+    initial_point_count: int,
+    generation_entries: list[dict[str, Any]],
+    threshold: float,
+    config: CoTrackerCacheConfig,
+    tracker: TrackerInfo,
+    complete: bool,
+    error: str | None = None,
+) -> dict[str, Any]:
+    metadata = {
+        "schema": SEGMENTED_CACHE_SCHEMA,
+        "coverage_model": "streamed_confidence_refresh_segments",
+        "complete": bool(complete),
+        "source_root": str(source_root),
+        "frame_start": int(frame_start),
+        "frame_end": int(frame_end),
+        "frame_count": int(frame_end - frame_start),
+        "width": int(width),
+        "height": int(height),
+        "point_count": int(sum(int(entry["point_count"]) for entry in generation_entries)),
+        "initial_point_count": int(initial_point_count),
+        "refresh_birth_count": int(
+            max(0, sum(int(entry["point_count"]) for entry in generation_entries) - int(initial_point_count))
+        ),
+        "refresh_generation_count": int(len(generation_entries)),
+        "abort_confidence_threshold": float(threshold),
+        "max_track_frames": int(config.max_track_frames),
+        "config": asdict(config),
+        "tracker": tracker.to_json(),
+        "generations": generation_entries,
+        "time_order": {
+            "tracks_reverse": "cache frame 0 is source frame frame_end - 1",
+            "source_frame_for_reverse_t": "source_frame = frame_end - 1 - reverse_t",
+            "birth_rule": (
+                "each generation is written immediately; child IDs are born when "
+                "their parent first falls below the confidence/visibility threshold "
+                "or reaches max_track_frames when that value is positive"
+            ),
+            "refresh_birth_xy": "abort-frame track coordinate, falling back to previous finite coordinate then seed",
+        },
+    }
+    if error:
+        metadata["error"] = str(error)
+    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    return metadata
+
+
+def _write_generation_record(
+    output_dir: Path,
+    *,
+    generation_index: int,
+    bundle: TrackingBundle,
+    queries: list[QueryPoint],
+    parent_ids: list[int],
+    abort_times: np.ndarray,
+    frame_end: int,
+) -> dict[str, Any]:
+    generation_dir = output_dir / f"generation_{generation_index:04d}"
+    point_ids = np.array([query.id for query in queries], dtype=np.int64)
+    birth_reverse_times = np.array([query.reverse_time for query in queries], dtype=np.int32)
+    seed_xy = np.array([[query.x, query.y] for query in queries], dtype=np.float32)
+    source_birth_frames = np.array(
+        [frame_end - 1 - query.reverse_time for query in queries],
+        dtype=np.int32,
+    )
+    parent_point_ids = np.array(parent_ids, dtype=np.int64)
+    generation_indices = np.full(len(queries), int(generation_index), dtype=np.int16)
+    abort_reverse_times = np.asarray(abort_times, dtype=np.int32)
+
+    arrays = {
+        "tracks": _write_relative_array(output_dir, generation_dir / "tracks_reverse.npy", bundle.tracks.astype(np.float32)),
+        "visibility": _write_relative_array(
+            output_dir,
+            generation_dir / "visibility_reverse.npy",
+            bundle.visibility.astype(bool),
+        ),
+        "point_ids": _write_relative_array(output_dir, generation_dir / "point_ids.npy", point_ids),
+        "birth_reverse_times": _write_relative_array(
+            output_dir,
+            generation_dir / "birth_reverse_times.npy",
+            birth_reverse_times,
+        ),
+        "source_birth_frames": _write_relative_array(
+            output_dir,
+            generation_dir / "source_birth_frames.npy",
+            source_birth_frames,
+        ),
+        "seed_xy": _write_relative_array(output_dir, generation_dir / "seed_xy.npy", seed_xy),
+        "parent_point_ids": _write_relative_array(
+            output_dir,
+            generation_dir / "parent_point_ids.npy",
+            parent_point_ids,
+        ),
+        "generation_indices": _write_relative_array(
+            output_dir,
+            generation_dir / "generation_indices.npy",
+            generation_indices,
+        ),
+        "abort_reverse_times": _write_relative_array(
+            output_dir,
+            generation_dir / "abort_reverse_times.npy",
+            abort_reverse_times,
+        ),
+    }
+    if bundle.confidence is not None:
+        arrays["confidence"] = _write_relative_array(
+            output_dir,
+            generation_dir / "confidence_reverse.npy",
+            bundle.confidence.astype(np.float32),
+        )
+    for name, component in bundle.confidence_components.items():
+        arrays[f"confidence_component_{name}"] = _write_relative_array(
+            output_dir,
+            generation_dir / f"{name}_reverse.npy",
+            component.astype(np.float32),
+        )
+
+    return {
+        "generation_index": int(generation_index),
+        "path": generation_dir.name,
+        "point_count": int(len(queries)),
+        "point_id_start": int(point_ids.min()) if point_ids.size else -1,
+        "point_id_end": int(point_ids.max()) + 1 if point_ids.size else -1,
+        "abort_count": int(np.count_nonzero(abort_reverse_times >= 0)),
+        "arrays": arrays,
+    }
+
+
 def build_cotracker_cache(
     *,
     source_root: Path,
@@ -329,9 +501,9 @@ def build_cotracker_cache(
 
     The cache seeds the selected region densely on reverse frame 0. Each point is
     checked on every later reverse frame; at the first low-confidence/invisible
-    frame, that parent ID is aborted and exactly one child ID is born at the
-    abort frame. No replacement IDs are created while the parent remains
-    reliable.
+    frame, that parent ID is aborted and exactly one child ID is born. If
+    max_track_frames is set, reliable IDs are also refreshed after that many
+    useful frames instead of being forced to survive the full chunk.
     """
 
     source_root = source_root.resolve()
@@ -367,11 +539,8 @@ def build_cotracker_cache(
         visibility_threshold=config.visibility_threshold,
     )
     threshold = _abort_threshold(config)
-    all_queries: list[QueryPoint] = []
-    all_parent_ids: list[int] = []
-    all_generation_indices: list[int] = []
-    all_abort_times: list[int] = []
-    bundles: list[TrackingBundle] = []
+    generation_entries: list[dict[str, Any]] = []
+    tracker_info: TrackerInfo | None = None
 
     current_queries = initial_queries
     current_parent_ids = [-1] * len(current_queries)
@@ -384,26 +553,66 @@ def build_cotracker_cache(
             f"tracking {len(current_queries)} point(s)",
             flush=True,
         )
-        bundle = tracker.track(frames_reverse, current_queries)
+        try:
+            bundle = tracker.track(frames_reverse, current_queries)
+        except Exception as exc:
+            if generation_entries and tracker_info is not None:
+                _write_segmented_metadata(
+                    output_dir,
+                    source_root=source_root,
+                    frame_start=config.frame_start,
+                    frame_end=frame_end,
+                    width=width,
+                    height=height,
+                    initial_point_count=len(initial_queries),
+                    generation_entries=generation_entries,
+                    threshold=threshold,
+                    config=config,
+                    tracker=tracker_info,
+                    complete=False,
+                    error=f"{exc.__class__.__name__}: {exc}",
+                )
+            raise
+        tracker_info = bundle.tracker
         bundle.validate(len(frames), len(current_queries))
         abort_times = _first_abort_times(
             bundle,
             current_queries,
             threshold=threshold,
+            max_track_frames=int(config.max_track_frames),
         )
-
-        bundles.append(bundle)
-        all_queries.extend(current_queries)
-        all_parent_ids.extend(current_parent_ids)
-        all_generation_indices.extend([generation_index] * len(current_queries))
-        all_abort_times.extend(int(value) for value in abort_times)
+        _truncate_bundle_at_aborts(bundle, abort_times)
+        generation_entry = _write_generation_record(
+            output_dir,
+            generation_index=generation_index,
+            bundle=bundle,
+            queries=current_queries,
+            parent_ids=current_parent_ids,
+            abort_times=abort_times,
+            frame_end=frame_end,
+        )
+        generation_entries.append(generation_entry)
+        _write_segmented_metadata(
+            output_dir,
+            source_root=source_root,
+            frame_start=config.frame_start,
+            frame_end=frame_end,
+            width=width,
+            height=height,
+            initial_point_count=len(initial_queries),
+            generation_entries=generation_entries,
+            threshold=threshold,
+            config=config,
+            tracker=tracker_info,
+            complete=False,
+        )
 
         next_queries: list[QueryPoint] = []
         next_parent_ids: list[int] = []
         for query_index, abort_t in enumerate(abort_times):
             if abort_t < 0:
                 continue
-            if config.max_query_points > 0 and len(all_queries) + len(next_queries) >= config.max_query_points:
+            if config.max_query_points > 0 and next_point_id + len(next_queries) >= config.max_query_points:
                 break
             x, y = _refresh_birth_xy(
                 bundle,
@@ -426,90 +635,46 @@ def build_cotracker_cache(
             next_parent_ids.append(int(current_queries[query_index].id))
             next_point_id += 1
 
-        _truncate_bundle_at_aborts(bundle, abort_times)
         elapsed = time.monotonic() - generation_started
         print(
             f"confidence-refresh generation {generation_index}: "
             f"aborted={int(np.count_nonzero(abort_times >= 0))} "
             f"created={len(next_queries)} "
-            f"threshold={threshold:.3f} elapsed={_format_duration(elapsed)}",
+            f"threshold={threshold:.3f} "
+            f"max_track_frames={int(config.max_track_frames)} "
+            f"{_refresh_offset_summary(current_queries, abort_times)} "
+            f"elapsed={_format_duration(elapsed)}",
             flush=True,
         )
+        del bundle
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
         current_queries = next_queries
         current_parent_ids = next_parent_ids
         generation_index += 1
 
-    tracks = np.concatenate([bundle.tracks.astype(np.float32) for bundle in bundles], axis=1)
-    visibility = np.concatenate([bundle.visibility.astype(bool) for bundle in bundles], axis=1)
-    confidence = (
-        np.concatenate([bundle.confidence.astype(np.float32) for bundle in bundles], axis=1)
-        if all(bundle.confidence is not None for bundle in bundles)
-        else None
+    if tracker_info is None:
+        raise RuntimeError("No CoTracker generations were written")
+    return _write_segmented_metadata(
+        output_dir,
+        source_root=source_root,
+        frame_start=config.frame_start,
+        frame_end=frame_end,
+        width=width,
+        height=height,
+        initial_point_count=len(initial_queries),
+        generation_entries=generation_entries,
+        threshold=threshold,
+        config=config,
+        tracker=tracker_info,
+        complete=True,
     )
-    confidence_components = _concat_confidence_components(bundles)
-
-    point_ids = np.array([query.id for query in all_queries], dtype=np.int64)
-    birth_reverse_times = np.array([query.reverse_time for query in all_queries], dtype=np.int32)
-    seed_xy = np.array([[query.x, query.y] for query in all_queries], dtype=np.float32)
-    source_birth_frames = np.array(
-        [frame_end - 1 - query.reverse_time for query in all_queries],
-        dtype=np.int32,
-    )
-    parent_point_ids = np.array(all_parent_ids, dtype=np.int64)
-    generation_indices = np.array(all_generation_indices, dtype=np.int16)
-    abort_reverse_times = np.array(all_abort_times, dtype=np.int32)
-
-    arrays = {
-        "tracks": _write_array(output_dir / "tracks_reverse.npy", tracks.astype(np.float32)),
-        "visibility": _write_array(output_dir / "visibility_reverse.npy", visibility.astype(bool)),
-        "point_ids": _write_array(output_dir / "point_ids.npy", point_ids),
-        "birth_reverse_times": _write_array(output_dir / "birth_reverse_times.npy", birth_reverse_times),
-        "source_birth_frames": _write_array(output_dir / "source_birth_frames.npy", source_birth_frames),
-        "seed_xy": _write_array(output_dir / "seed_xy.npy", seed_xy),
-        "parent_point_ids": _write_array(output_dir / "parent_point_ids.npy", parent_point_ids),
-        "generation_indices": _write_array(output_dir / "generation_indices.npy", generation_indices),
-        "abort_reverse_times": _write_array(output_dir / "abort_reverse_times.npy", abort_reverse_times),
-    }
-    if confidence is not None:
-        arrays["confidence"] = _write_array(
-            output_dir / "confidence_reverse.npy",
-            confidence.astype(np.float32),
-        )
-    for name, component in confidence_components.items():
-        arrays[f"confidence_component_{name}"] = _write_array(
-            output_dir / f"{name}_reverse.npy",
-            component.astype(np.float32),
-        )
-
-    metadata = {
-        "schema": CACHE_SCHEMA,
-        "coverage_model": "dense_confidence_refresh",
-        "source_root": str(source_root),
-        "frame_start": int(config.frame_start),
-        "frame_end": int(frame_end),
-        "frame_count": int(frame_end - config.frame_start),
-        "width": int(width),
-        "height": int(height),
-        "point_count": int(len(all_queries)),
-        "initial_point_count": int(len(initial_queries)),
-        "refresh_birth_count": int(len(all_queries) - len(initial_queries)),
-        "refresh_generation_count": int(generation_index),
-        "abort_confidence_threshold": threshold,
-        "config": asdict(config),
-        "tracker": bundles[0].tracker.to_json(),
-        "arrays": arrays,
-        "time_order": {
-            "tracks_reverse": "cache frame 0 is source frame frame_end - 1",
-            "source_frame_for_reverse_t": "source_frame = frame_end - 1 - reverse_t",
-            "birth_rule": (
-                "initial raw dense IDs are born on reverse frame 0; child IDs are born only "
-                "when their parent first falls below the confidence/visibility threshold"
-            ),
-            "refresh_birth_xy": "abort-frame track coordinate, falling back to previous finite coordinate then seed",
-        },
-    }
-    (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-    return metadata
 
 
 def _chunk_ranges(frame_count: int, config: CoTrackerChunkCacheConfig) -> list[tuple[int, int]]:
@@ -554,7 +719,10 @@ def _cache_metadata_matches(path: Path, *, frame_start: int, frame_end: int, con
         metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    if metadata.get("schema") != CACHE_SCHEMA:
+    schema = metadata.get("schema")
+    if schema not in (CACHE_SCHEMA, SEGMENTED_CACHE_SCHEMA):
+        return False
+    if schema == SEGMENTED_CACHE_SCHEMA and not bool(metadata.get("complete", False)):
         return False
     if int(metadata.get("frame_start", -1)) != int(frame_start):
         return False
@@ -569,11 +737,21 @@ def _cache_metadata_matches(path: Path, *, frame_start: int, frame_end: int, con
         "max_query_points",
         "visibility_threshold",
         "abort_confidence_threshold",
+        "max_track_frames",
     ):
         if existing.get(key) != getattr(config, key):
             return False
-    arrays = metadata.get("arrays", {})
-    return all((path / arrays[name]).exists() for name in ("tracks", "visibility", "point_ids"))
+    if schema == CACHE_SCHEMA:
+        arrays = metadata.get("arrays", {})
+        return all((path / arrays[name]).exists() for name in ("tracks", "visibility", "point_ids"))
+    generations = metadata.get("generations", [])
+    if not generations:
+        return False
+    for generation in generations:
+        arrays = generation.get("arrays", {})
+        if not all((path / arrays[name]).exists() for name in ("tracks", "visibility", "point_ids")):
+            return False
+    return True
 
 
 def _format_duration(seconds: float) -> str:
@@ -671,6 +849,43 @@ def build_cotracker_cache_chunks(
     return manifest
 
 
+class _SegmentedArrayProxy:
+    def __init__(self, arrays: list[np.ndarray], offsets: list[int], point_count: int) -> None:
+        if not arrays:
+            raise ValueError("Segmented array proxy needs at least one array")
+        self.arrays = arrays
+        self.offsets = offsets
+        self.point_count = int(point_count)
+        self.shape = (arrays[0].shape[0], self.point_count, *arrays[0].shape[2:])
+        self.dtype = arrays[0].dtype
+
+    def _slice_points(self, frames: np.ndarray, points: np.ndarray) -> np.ndarray:
+        frames = np.asarray(frames, dtype=np.int64).reshape(-1)
+        points = np.asarray(points, dtype=np.int64).reshape(-1)
+        out = np.zeros((len(frames), len(points), *self.shape[2:]), dtype=self.dtype)
+        if np.issubdtype(self.dtype, np.floating):
+            out[...] = np.nan
+        for array, offset in zip(self.arrays, self.offsets):
+            end = offset + array.shape[1]
+            mask = (points >= offset) & (points < end)
+            if not mask.any():
+                continue
+            local_points = points[mask] - offset
+            out[:, mask] = array[np.ix_(frames, local_points)]
+        return out
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            frames, points = key
+            return self._slice_points(np.asarray(frames).reshape(-1), np.asarray(points).reshape(-1))
+        if isinstance(key, (int, np.integer)):
+            frame = int(key)
+            return np.concatenate([array[frame] for array in self.arrays], axis=0)
+        frames = np.arange(self.shape[0], dtype=np.int64)[key]
+        points = np.arange(self.point_count, dtype=np.int64)
+        return self._slice_points(np.asarray(frames), points)
+
+
 class CoTrackerCache:
     def __init__(self, path: Path, *, mmap_mode: str | None = "r") -> None:
         root = path if path.is_dir() else path.parent
@@ -678,8 +893,16 @@ class CoTrackerCache:
         self.root = root.resolve()
         self.metadata_path = metadata_path.resolve()
         self.metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
-        if self.metadata.get("schema") != CACHE_SCHEMA:
+        schema = self.metadata.get("schema")
+        if schema not in (CACHE_SCHEMA, SEGMENTED_CACHE_SCHEMA):
             raise ValueError(f"Unsupported CoTracker cache schema: {self.metadata.get('schema')}")
+        self.frame_start = int(self.metadata["frame_start"])
+        self.frame_end = int(self.metadata["frame_end"])
+        self.frame_count = int(self.metadata["frame_count"])
+        if schema == SEGMENTED_CACHE_SCHEMA:
+            self._load_segmented(mmap_mode=mmap_mode)
+            return
+
         arrays = self.metadata["arrays"]
         self.tracks = np.load(self.root / arrays["tracks"], mmap_mode=mmap_mode)
         self.visibility = np.load(self.root / arrays["visibility"], mmap_mode=mmap_mode)
@@ -718,9 +941,67 @@ class CoTrackerCache:
             for key, filename in arrays.items()
             if key.startswith("confidence_component_")
         }
-        self.frame_start = int(self.metadata["frame_start"])
-        self.frame_end = int(self.metadata["frame_end"])
-        self.frame_count = int(self.metadata["frame_count"])
+
+    def _load_segmented(self, *, mmap_mode: str | None) -> None:
+        generations = self.metadata.get("generations", [])
+        if not generations:
+            raise ValueError(f"Segmented CoTracker cache has no generations: {self.metadata_path}")
+
+        tracks_arrays: list[np.ndarray] = []
+        visibility_arrays: list[np.ndarray] = []
+        confidence_arrays: list[np.ndarray] = []
+        component_arrays: dict[str, list[np.ndarray]] = {}
+        offsets: list[int] = []
+        point_ids = []
+        birth_reverse_times = []
+        source_birth_frames = []
+        seed_xy = []
+        parent_point_ids = []
+        generation_indices = []
+        abort_reverse_times = []
+        point_offset = 0
+
+        for generation in generations:
+            arrays = generation["arrays"]
+            count = int(generation["point_count"])
+            offsets.append(point_offset)
+            point_offset += count
+            tracks_arrays.append(np.load(self.root / arrays["tracks"], mmap_mode=mmap_mode))
+            visibility_arrays.append(np.load(self.root / arrays["visibility"], mmap_mode=mmap_mode))
+            if "confidence" in arrays:
+                confidence_arrays.append(np.load(self.root / arrays["confidence"], mmap_mode=mmap_mode))
+            for key, filename in arrays.items():
+                if key.startswith("confidence_component_"):
+                    component_arrays.setdefault(key.removeprefix("confidence_component_"), []).append(
+                        np.load(self.root / filename, mmap_mode=mmap_mode)
+                    )
+            point_ids.append(np.load(self.root / arrays["point_ids"], mmap_mode=mmap_mode))
+            birth_reverse_times.append(np.load(self.root / arrays["birth_reverse_times"], mmap_mode=mmap_mode))
+            source_birth_frames.append(np.load(self.root / arrays["source_birth_frames"], mmap_mode=mmap_mode))
+            seed_xy.append(np.load(self.root / arrays["seed_xy"], mmap_mode=mmap_mode))
+            parent_point_ids.append(np.load(self.root / arrays["parent_point_ids"], mmap_mode=mmap_mode))
+            generation_indices.append(np.load(self.root / arrays["generation_indices"], mmap_mode=mmap_mode))
+            abort_reverse_times.append(np.load(self.root / arrays["abort_reverse_times"], mmap_mode=mmap_mode))
+
+        self.tracks = _SegmentedArrayProxy(tracks_arrays, offsets, point_offset)
+        self.visibility = _SegmentedArrayProxy(visibility_arrays, offsets, point_offset)
+        self.confidence = (
+            _SegmentedArrayProxy(confidence_arrays, offsets, point_offset)
+            if len(confidence_arrays) == len(generations)
+            else None
+        )
+        self.confidence_components = {
+            name: _SegmentedArrayProxy(arrays, offsets, point_offset)
+            for name, arrays in component_arrays.items()
+            if len(arrays) == len(generations)
+        }
+        self.point_ids = np.concatenate(point_ids).astype(np.int64)
+        self.birth_reverse_times = np.concatenate(birth_reverse_times).astype(np.int32)
+        self.source_birth_frames = np.concatenate(source_birth_frames).astype(np.int32)
+        self.seed_xy = np.concatenate(seed_xy).astype(np.float32)
+        self.parent_point_ids = np.concatenate(parent_point_ids).astype(np.int64)
+        self.generation_indices = np.concatenate(generation_indices).astype(np.int16)
+        self.abort_reverse_times = np.concatenate(abort_reverse_times).astype(np.int32)
 
     def reverse_index_for_source_frame(self, source_frame: int) -> int:
         reverse_t = self.frame_end - 1 - int(source_frame)

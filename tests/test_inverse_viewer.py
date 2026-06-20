@@ -41,9 +41,12 @@ from avt.tracking.cotracker_cache import (
     CHUNKED_CACHE_SCHEMA,
     CachedCoTrackerBackend,
     CACHE_SCHEMA,
+    CoTrackerCache,
     CoTrackerCacheConfig,
+    SEGMENTED_CACHE_SCHEMA,
     cotracker_cache_config_from_mapping,
     _cache_queries,
+    _first_abort_times,
 )
 from avt.tracking.foundationpose import FoundationPoseBackend
 from avt.tracking.foundationpose.download import FOUNDATIONPOSE_WEIGHT_FILES
@@ -341,6 +344,82 @@ def test_cotracker_cache_queries_seed_initial_dense_frame_by_default() -> None:
     assert [query.id for query in queries] == list(range(6))
 
 
+def test_cotracker_cache_horizon_refreshes_reliable_tracks() -> None:
+    query = QueryPoint(id=0, reverse_time=0, x=1, y=2, side=0)
+    bundle = TrackingBundle(
+        tracks=np.zeros((10, 1, 2), dtype=np.float32),
+        visibility=np.ones((10, 1), dtype=bool),
+        confidence=np.ones((10, 1), dtype=np.float32),
+        tracker=TrackerInfo(name="synthetic"),
+    )
+
+    assert _first_abort_times(bundle, [query], threshold=0.85).tolist() == [-1]
+    assert _first_abort_times(bundle, [query], threshold=0.85, max_track_frames=4).tolist() == [4]
+
+
+def test_segmented_cotracker_cache_indexes_generations(tmp_path: Path) -> None:
+    generations = []
+    for generation_index, point_ids in enumerate(([10, 11], [20])):
+        gen_dir = tmp_path / f"generation_{generation_index:04d}"
+        gen_dir.mkdir()
+        point_ids_array = np.array(point_ids, dtype=np.int64)
+        tracks = np.zeros((4, len(point_ids), 2), dtype=np.float32)
+        for local_index, point_id in enumerate(point_ids):
+            tracks[:, local_index, 0] = point_id
+            tracks[:, local_index, 1] = np.arange(4, dtype=np.float32)
+        visibility = np.ones((4, len(point_ids)), dtype=bool)
+        confidence = np.ones((4, len(point_ids)), dtype=np.float32) * (0.5 + generation_index)
+        arrays = {}
+        for name, array in {
+            "tracks": tracks,
+            "visibility": visibility,
+            "point_ids": point_ids_array,
+            "birth_reverse_times": np.zeros(len(point_ids), dtype=np.int32),
+            "source_birth_frames": np.full(len(point_ids), 3, dtype=np.int32),
+            "seed_xy": np.zeros((len(point_ids), 2), dtype=np.float32),
+            "parent_point_ids": np.full(len(point_ids), -1, dtype=np.int64),
+            "generation_indices": np.full(len(point_ids), generation_index, dtype=np.int16),
+            "abort_reverse_times": np.full(len(point_ids), -1, dtype=np.int32),
+            "confidence": confidence,
+        }.items():
+            filename = f"{name}.npy"
+            np.save(gen_dir / filename, array)
+            arrays[name] = f"{gen_dir.name}/{filename}"
+        generations.append(
+            {
+                "generation_index": generation_index,
+                "path": gen_dir.name,
+                "point_count": len(point_ids),
+                "arrays": arrays,
+            }
+        )
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "schema": SEGMENTED_CACHE_SCHEMA,
+                "complete": False,
+                "frame_start": 0,
+                "frame_end": 4,
+                "frame_count": 4,
+                "source_root": str(tmp_path),
+                "point_count": 3,
+                "generations": generations,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    cache = CoTrackerCache(tmp_path)
+
+    assert cache.point_ids.tolist() == [10, 11, 20]
+    assert cache.tracks[2].shape == (3, 2)
+    assert cache.tracks[2][:, 0].tolist() == [10.0, 11.0, 20.0]
+    selected = cache.tracks[np.ix_(np.array([1, 3]), np.array([0, 2]))]
+    assert selected.shape == (2, 2, 2)
+    assert selected[:, :, 0].tolist() == [[10.0, 20.0], [10.0, 20.0]]
+    assert cache.confidence[np.ix_(np.array([0]), np.array([0, 2]))].tolist() == [[0.5, 1.5]]
+
+
 def test_cotracker_cache_config_from_yaml_mapping() -> None:
     config = cotracker_cache_config_from_mapping(
         {
@@ -352,6 +431,7 @@ def test_cotracker_cache_config_from_yaml_mapping() -> None:
             "cache": {
                 "region": "bottom-half",
                 "bad_track_confidence_threshold": 0.72,
+                "max_track_frames": 100,
             },
             "tracker": {
                 "device": "cpu",
@@ -368,6 +448,7 @@ def test_cotracker_cache_config_from_yaml_mapping() -> None:
     assert config.cache.region == "bottom-half"
     assert config.cache.query_mode == "confidence-refresh"
     assert config.cache.abort_confidence_threshold == 0.72
+    assert config.cache.max_track_frames == 100
     assert config.cache.visibility_threshold == 0.80
     assert config.cache.device == "cpu"
     assert config.cache.batch_size == 32
