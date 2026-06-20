@@ -40,6 +40,7 @@ class CoTrackerCacheConfig:
     visibility_threshold: float = 0.9
     abort_confidence_threshold: float | None = None
     max_track_frames: int = 0
+    refresh_birth_delay_frames: int = 0
 
 
 @dataclass
@@ -288,6 +289,15 @@ def _refresh_offset_summary(queries: list[QueryPoint], refresh_times: np.ndarray
     )
 
 
+def _child_birth_reverse_time(abort_t: int, frame_count: int, delay_frames: int) -> int | None:
+    if delay_frames < 0:
+        raise ValueError("refresh_birth_delay_frames must be non-negative")
+    birth_t = int(abort_t) + int(delay_frames)
+    if birth_t >= int(frame_count):
+        return None
+    return birth_t
+
+
 def _clamp_xy(xy: np.ndarray, *, height: int, width: int) -> tuple[float, float]:
     x = float(np.clip(float(xy[0]), 0.0, max(0.0, float(width - 1))))
     y = float(np.clip(float(xy[1]), 0.0, max(0.0, float(height - 1))))
@@ -389,6 +399,7 @@ def _write_segmented_metadata(
         "refresh_generation_count": int(len(generation_entries)),
         "abort_confidence_threshold": float(threshold),
         "max_track_frames": int(config.max_track_frames),
+        "refresh_birth_delay_frames": int(config.refresh_birth_delay_frames),
         "config": asdict(config),
         "tracker": tracker.to_json(),
         "generations": generation_entries,
@@ -398,7 +409,8 @@ def _write_segmented_metadata(
             "birth_rule": (
                 "each generation is written immediately; child IDs are born when "
                 "their parent first falls below the confidence/visibility threshold "
-                "or reaches max_track_frames when that value is positive"
+                "or reaches max_track_frames when that value is positive; child "
+                "birth can be delayed by refresh_birth_delay_frames"
             ),
             "refresh_birth_xy": "abort-frame track coordinate, falling back to previous finite coordinate then seed",
         },
@@ -503,7 +515,8 @@ def build_cotracker_cache(
     checked on every later reverse frame; at the first low-confidence/invisible
     frame, that parent ID is aborted and exactly one child ID is born. If
     max_track_frames is set, reliable IDs are also refreshed after that many
-    useful frames instead of being forced to survive the full chunk.
+    useful frames instead of being forced to survive the full chunk. Child IDs
+    can be delayed after parent abort by refresh_birth_delay_frames.
     """
 
     source_root = source_root.resolve()
@@ -612,6 +625,13 @@ def build_cotracker_cache(
         for query_index, abort_t in enumerate(abort_times):
             if abort_t < 0:
                 continue
+            child_birth_t = _child_birth_reverse_time(
+                int(abort_t),
+                len(frames),
+                int(config.refresh_birth_delay_frames),
+            )
+            if child_birth_t is None:
+                continue
             if config.max_query_points > 0 and next_point_id + len(next_queries) >= config.max_query_points:
                 break
             x, y = _refresh_birth_xy(
@@ -625,7 +645,7 @@ def build_cotracker_cache(
             next_queries.append(
                 QueryPoint(
                     id=next_point_id,
-                    reverse_time=int(abort_t),
+                    reverse_time=int(child_birth_t),
                     x=x,
                     y=y,
                     side=0,
@@ -642,6 +662,7 @@ def build_cotracker_cache(
             f"created={len(next_queries)} "
             f"threshold={threshold:.3f} "
             f"max_track_frames={int(config.max_track_frames)} "
+            f"refresh_birth_delay_frames={int(config.refresh_birth_delay_frames)} "
             f"{_refresh_offset_summary(current_queries, abort_times)} "
             f"elapsed={_format_duration(elapsed)}",
             flush=True,
@@ -738,6 +759,7 @@ def _cache_metadata_matches(path: Path, *, frame_start: int, frame_end: int, con
         "visibility_threshold",
         "abort_confidence_threshold",
         "max_track_frames",
+        "refresh_birth_delay_frames",
     ):
         if existing.get(key) != getattr(config, key):
             return False

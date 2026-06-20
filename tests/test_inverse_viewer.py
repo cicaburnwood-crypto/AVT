@@ -45,6 +45,7 @@ from avt.tracking.cotracker_cache import (
     CoTrackerCacheConfig,
     SEGMENTED_CACHE_SCHEMA,
     cotracker_cache_config_from_mapping,
+    _child_birth_reverse_time,
     _cache_queries,
     _first_abort_times,
 )
@@ -357,6 +358,12 @@ def test_cotracker_cache_horizon_refreshes_reliable_tracks() -> None:
     assert _first_abort_times(bundle, [query], threshold=0.85, max_track_frames=4).tolist() == [4]
 
 
+def test_cotracker_cache_child_birth_delay() -> None:
+    assert _child_birth_reverse_time(5, 20, 0) == 5
+    assert _child_birth_reverse_time(5, 20, 10) == 15
+    assert _child_birth_reverse_time(15, 20, 10) is None
+
+
 def test_segmented_cotracker_cache_indexes_generations(tmp_path: Path) -> None:
     generations = []
     for generation_index, point_ids in enumerate(([10, 11], [20])):
@@ -432,6 +439,7 @@ def test_cotracker_cache_config_from_yaml_mapping() -> None:
                 "region": "bottom-half",
                 "bad_track_confidence_threshold": 0.72,
                 "max_track_frames": 100,
+                "refresh_birth_delay_frames": 10,
             },
             "tracker": {
                 "device": "cpu",
@@ -449,6 +457,7 @@ def test_cotracker_cache_config_from_yaml_mapping() -> None:
     assert config.cache.query_mode == "confidence-refresh"
     assert config.cache.abort_confidence_threshold == 0.72
     assert config.cache.max_track_frames == 100
+    assert config.cache.refresh_birth_delay_frames == 10
     assert config.cache.visibility_threshold == 0.80
     assert config.cache.device == "cpu"
     assert config.cache.batch_size == 32

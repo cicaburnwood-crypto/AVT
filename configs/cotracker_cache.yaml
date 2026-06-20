@@ -18,6 +18,8 @@ cache:
   # 0 means record each ID until it actually aborts/fades. Positive values can
   # force periodic refreshes, but the default does not impose a success horizon.
   max_track_frames: 0
+  # Delay child IDs after a parent aborts/fades. 0 preserves immediate rebirth.
+  refresh_birth_delay_frames: 0
 
 tracker:
   device: cuda
