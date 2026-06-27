@@ -111,6 +111,40 @@ the anchors. `--query-mode sift` keeps only the robot-footprint crumbs, and
 `avt+sift` is accepted as a compatibility alias for the VENTURA anchor+crumb
 pipeline.
 
+### Point-Extraction Detectors
+
+The keypoint detector used to propose query points (Stage 2) is selectable with
+`--detector`, independently of `--query-mode` and `--backend`. All methods reuse
+the same VENTURA anchor/crumb masking and top-N selection; only the keypoint
+source differs. Descriptors are discarded — only locations are tracked.
+
+| `--detector` | Engine | Extra deps | Notes |
+|--------------|--------|-----------|-------|
+| `sift` (default) | OpenCV SIFT | none | Byte-identical to prior behavior. |
+| `orb` | OpenCV ORB | none | Fast, license-free corners. Tune `--orb-nfeatures`, `--orb-score-type`. |
+| `superpoint` | SuperPoint (HF Transformers) | `avt[superpoint]` | Pure SuperPoint keypoints by default. `--superpoint-use-superglue` enables a SuperGlue cross-frame match prefilter (keeps only repeatable/trackable points; **`superglue_outdoor` weights are research/non-commercial**). |
+| `xfeat` | XFeat (torch.hub `verlab/accelerated_features`) | `avt[xfeat]` | Lightweight learned features. Tune `--xfeat-top-k`. |
+
+```bash
+python -m avt.cli track --frames-root frames/ --backend cotracker --detector orb --orb-nfeatures 4000
+```
+
+`sift` and `orb` need only OpenCV; `superpoint` and `xfeat` lazy-import torch
+(and transformers for superpoint) and raise a clear install hint if missing, so
+the default pipeline runs without those heavy dependencies. Detector settings
+can also be set in the YAML config under a `detector:` key plus `orb:`,
+`superpoint:`, or `xfeat:` blocks.
+
+#### Detector model weights
+
+Learned-detector weights are **not bundled in this repo**. They download
+automatically on first use into the HuggingFace / torch.hub caches (override
+with `--superpoint-device`, `--xfeat-checkpoint`, etc.):
+
+- SuperPoint: [`magic-leap-community/superpoint`](https://huggingface.co/magic-leap-community/superpoint)
+- SuperGlue (optional prefilter): [`magic-leap-community/superglue_outdoor`](https://huggingface.co/magic-leap-community/superglue_outdoor) — research/non-commercial license
+- XFeat: [`verlab/accelerated_features`](https://github.com/verlab/accelerated_features) via `torch.hub` (weights `xfeat.pt`)
+
 The VENTURA alignment is calibration-free. It reads the decoded frame width and
 height for each window, applies `ROBOT_WIDTH_PCT` and `ROBOT_HEIGHT_PCT` style
 percentages to a bottom-center rectangle, and records the resolved pixel bounds

@@ -8,6 +8,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .detectors import build_detector
+from .detectors.config import OrbDetectorConfig, SuperPointConfig, XFeatConfig
 from .schema import QueryPoint
 
 
@@ -123,8 +125,12 @@ class QueryConfig:
     """Top-level query source configuration."""
 
     mode: str = "ventura"
+    detector: str = "sift"
     robot: VirtualRobotConfig = field(default_factory=VirtualRobotConfig)
     sift: SiftCaptureConfig = field(default_factory=SiftCaptureConfig)
+    orb: OrbDetectorConfig = field(default_factory=OrbDetectorConfig)
+    superpoint: SuperPointConfig = field(default_factory=SuperPointConfig)
+    xfeat: XFeatConfig = field(default_factory=XFeatConfig)
 
 
 def load_query_config_yaml(path: Path) -> QueryConfig:
@@ -138,6 +144,63 @@ def load_query_config_yaml(path: Path) -> QueryConfig:
     if not isinstance(data, dict):
         raise ValueError(f"Robot config must be a YAML mapping: {path}")
     return query_config_from_mapping(data)
+
+
+_DETECTORS = ("sift", "orb", "superpoint", "xfeat")
+
+
+def _validate_detector(name: str) -> str:
+    if name not in _DETECTORS:
+        raise ValueError(f"detector must be one of {_DETECTORS}, got {name!r}")
+    return name
+
+
+def _orb_config_from_mapping(data: dict[str, Any]) -> OrbDetectorConfig:
+    if not isinstance(data, dict):
+        raise ValueError("orb must be a mapping")
+    base = OrbDetectorConfig()
+    return OrbDetectorConfig(
+        nfeatures=int(data.get("nfeatures", base.nfeatures)),
+        scale_factor=float(data.get("scale_factor", base.scale_factor)),
+        n_levels=int(data.get("n_levels", base.n_levels)),
+        edge_threshold=int(data.get("edge_threshold", base.edge_threshold)),
+        first_level=int(data.get("first_level", base.first_level)),
+        wta_k=int(data.get("wta_k", base.wta_k)),
+        score_type=str(data.get("score_type", base.score_type)),
+        patch_size=int(data.get("patch_size", base.patch_size)),
+        fast_threshold=int(data.get("fast_threshold", base.fast_threshold)),
+        use_clahe=_as_bool(data.get("use_clahe", base.use_clahe)),
+    )
+
+
+def _superpoint_config_from_mapping(data: dict[str, Any]) -> SuperPointConfig:
+    if not isinstance(data, dict):
+        raise ValueError("superpoint must be a mapping")
+    base = SuperPointConfig()
+    return SuperPointConfig(
+        model=str(data.get("model", base.model)),
+        use_superglue=_as_bool(data.get("use_superglue", base.use_superglue)),
+        superglue_model=str(data.get("superglue_model", base.superglue_model)),
+        keypoint_threshold=float(data.get("keypoint_threshold", base.keypoint_threshold)),
+        max_keypoints=int(data.get("max_keypoints", base.max_keypoints)),
+        match_threshold=float(data.get("match_threshold", base.match_threshold)),
+        neighbor_offset=int(data.get("neighbor_offset", base.neighbor_offset)),
+        device=data.get("device", base.device),
+    )
+
+
+def _xfeat_config_from_mapping(data: dict[str, Any]) -> XFeatConfig:
+    if not isinstance(data, dict):
+        raise ValueError("xfeat must be a mapping")
+    base = XFeatConfig()
+    return XFeatConfig(
+        hub_repo=str(data.get("hub_repo", base.hub_repo)),
+        model=str(data.get("model", base.model)),
+        top_k=int(data.get("top_k", base.top_k)),
+        detection_threshold=float(data.get("detection_threshold", base.detection_threshold)),
+        checkpoint=data.get("checkpoint", base.checkpoint),
+        device=data.get("device", base.device),
+    )
 
 
 def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
@@ -207,7 +270,19 @@ def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
         sift = replace(sift, enabled=True)
     if sift.enabled and mode == "avt":
         mode = "ventura"
-    return QueryConfig(mode=mode, robot=robot, sift=sift)
+    detector = _validate_detector(str(data.get("detector", "sift")))
+    orb = _orb_config_from_mapping(data.get("orb", {}) or {})
+    superpoint = _superpoint_config_from_mapping(data.get("superpoint", {}) or {})
+    xfeat = _xfeat_config_from_mapping(data.get("xfeat", {}) or {})
+    return QueryConfig(
+        mode=mode,
+        detector=detector,
+        robot=robot,
+        sift=sift,
+        orb=orb,
+        superpoint=superpoint,
+        xfeat=xfeat,
+    )
 
 
 def merge_query_config(
@@ -215,6 +290,10 @@ def merge_query_config(
     *,
     mode: str | None = None,
     enable_sift: bool | None = None,
+    detector: str | None = None,
+    orb: OrbDetectorConfig | None = None,
+    superpoint: SuperPointConfig | None = None,
+    xfeat: XFeatConfig | None = None,
 ) -> QueryConfig:
     next_mode = _validate_mode(mode) if mode else base.mode
     next_sift = base.sift
@@ -224,7 +303,16 @@ def merge_query_config(
         next_sift = replace(next_sift, enabled=enable_sift)
         if enable_sift and next_mode == "avt":
             next_mode = "ventura"
-    return replace(base, mode=next_mode, sift=next_sift)
+    next_detector = _validate_detector(detector) if detector else base.detector
+    return replace(
+        base,
+        mode=next_mode,
+        detector=next_detector,
+        sift=next_sift,
+        orb=orb if orb is not None else base.orb,
+        superpoint=superpoint if superpoint is not None else base.superpoint,
+        xfeat=xfeat if xfeat is not None else base.xfeat,
+    )
 
 
 def build_avt_queries(
@@ -289,12 +377,12 @@ def build_sift_queries(
     frame_count, height, width = frames_rgb.shape[:3]
     mask = robot_sift_mask(height, width, query_config.robot, query_config.sift)
     times = _sift_times(frame_count, query_config.sift.window_size)
-    return _sample_sift_queries(
+    return _sample_detector_queries(
         frames_rgb=frames_rgb,
+        query_config=query_config,
         times=times,
         max_query_points=query_config.sift.max_query_points,
         mask=mask,
-        sift_config=query_config.sift,
         params=query_config.sift,
         source="sift_robot",
         start_id=start_id,
@@ -325,12 +413,12 @@ def build_ventura_queries(
         if anchor_window <= 0:
             raise ValueError("sift anchor window_size must be positive")
         queries.extend(
-            _sample_sift_queries(
+            _sample_detector_queries(
                 frames_rgb=frames_rgb,
+                query_config=query_config,
                 times=_sift_times(frame_count, anchor_window),
                 max_query_points=anchors.max_query_points,
                 mask=None,
-                sift_config=query_config.sift,
                 params=anchors,
                 source="sift_anchor",
                 start_id=start_id + len(queries),
@@ -338,12 +426,12 @@ def build_ventura_queries(
             )
         )
     queries.extend(
-        _sample_sift_queries(
+        _sample_detector_queries(
             frames_rgb=frames_rgb,
+            query_config=query_config,
             times=_sift_times(frame_count, query_config.sift.window_size),
             max_query_points=query_config.sift.max_query_points,
             mask=robot_sift_mask(height, width, query_config.robot, query_config.sift),
-            sift_config=query_config.sift,
             params=query_config.sift,
             source="sift_robot",
             start_id=start_id + len(queries),
@@ -353,13 +441,13 @@ def build_ventura_queries(
     return queries
 
 
-def _sample_sift_queries(
+def _sample_detector_queries(
     *,
     frames_rgb: np.ndarray,
+    query_config: QueryConfig,
     times: list[int],
     max_query_points: int,
     mask: np.ndarray | None,
-    sift_config: SiftCaptureConfig,
     params: SiftCaptureConfig | SiftAnchorConfig,
     source: str,
     start_id: int,
@@ -370,19 +458,11 @@ def _sample_sift_queries(
     if not times:
         return []
     _, height, width = frames_rgb.shape[:3]
-    sift_detector = cv2.SIFT_create(
-        nfeatures=0,
-        nOctaveLayers=params.n_octave_layers,
-        contrastThreshold=params.contrast_threshold,
-        edgeThreshold=params.edge_threshold,
-        sigma=params.sigma,
-    )
+    detector = build_detector(query_config, params)
     samples_per_time = _samples_per_time(max_query_points, len(times), params)
     queries: list[QueryPoint] = []
     for reverse_time in times:
-        gray = cv2.cvtColor(frames_rgb[reverse_time], cv2.COLOR_RGB2GRAY)
-        gray = _local_equalize(gray, sift_config=sift_config)
-        keypoints, _ = sift_detector.detectAndCompute(gray, mask)
+        keypoints = detector.detect(frames_rgb, reverse_time, mask)
         if not keypoints:
             continue
         picked = _pick_sift_keypoints(
@@ -432,17 +512,6 @@ def _pick_sift_keypoints(
         picked_ids = {id(kp) for kp in picked}
         picked.extend([kp for kp in ordered if id(kp) not in picked_ids][: count - len(picked)])
     return picked
-
-
-def _local_equalize(gray: np.ndarray, *, sift_config: SiftCaptureConfig) -> np.ndarray:
-    if not sift_config.use_clahe:
-        return gray
-    tile = max(1, int(sift_config.clahe_tile_grid_size))
-    clahe = cv2.createCLAHE(
-        clipLimit=float(sift_config.clahe_clip_limit),
-        tileGridSize=(tile, tile),
-    )
-    return clahe.apply(gray)
 
 
 def robot_sift_mask(

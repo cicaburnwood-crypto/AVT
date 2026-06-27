@@ -30,6 +30,14 @@ bootstap = [
   "einops>=0.8",
   "tapnet @ git+https://github.com/google-deepmind/tapnet.git",
 ]
+superpoint = [
+  "torch>=2.0",
+  "transformers>=4.40",
+]
+xfeat = [
+  "torch>=2.0",
+  "torchvision>=0.15",
+]
 dev = [
   "pytest>=8.0",
 ]

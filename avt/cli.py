@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from datetime import datetime
 import json
 from pathlib import Path
@@ -104,13 +105,51 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--path-support-fraction", type=int, default=6)
 
 
+def _override(base, **kwargs):
+    """Return ``base`` with only the non-None overrides applied."""
+    updates = {key: value for key, value in kwargs.items() if value is not None}
+    return replace(base, **updates) if updates else base
+
+
 def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
     query_config = (
         load_query_config_yaml(args.robot_config)
         if args.robot_config
         else QueryConfig()
     )
-    query_config = merge_query_config(query_config, mode=args.query_mode)
+    orb = _override(
+        query_config.orb,
+        nfeatures=args.orb_nfeatures,
+        scale_factor=args.orb_scale_factor,
+        n_levels=args.orb_nlevels,
+        fast_threshold=args.orb_fast_threshold,
+        score_type=args.orb_score_type,
+    )
+    superpoint = _override(
+        query_config.superpoint,
+        model=args.superpoint_model,
+        max_keypoints=args.superpoint_max_keypoints,
+        device=args.superpoint_device,
+        use_superglue=args.superpoint_use_superglue,
+        superglue_model=args.superglue_model,
+        match_threshold=args.superglue_match_threshold,
+        neighbor_offset=args.superglue_neighbor_offset,
+    )
+    xfeat = _override(
+        query_config.xfeat,
+        hub_repo=args.xfeat_hub_repo,
+        top_k=args.xfeat_top_k,
+        device=args.xfeat_device,
+        checkpoint=str(args.xfeat_checkpoint) if args.xfeat_checkpoint else None,
+    )
+    query_config = merge_query_config(
+        query_config,
+        mode=args.query_mode,
+        detector=args.detector,
+        orb=orb,
+        superpoint=superpoint,
+        xfeat=xfeat,
+    )
     return InverseTrackConfig(
         window_size=args.window_size,
         window_step=args.window_step,
@@ -360,6 +399,37 @@ def build_parser() -> argparse.ArgumentParser:
             default=None,
             help="Use strict checkpoint loading for the BootsTAPIR model.",
         )
+
+        # Point-extraction detector (Stage 2). SIFT/ORB need only OpenCV;
+        # superpoint/xfeat need torch (+ transformers for superpoint).
+        cmd.add_argument(
+            "--detector",
+            choices=("sift", "orb", "superpoint", "xfeat"),
+            default=None,
+            help="Keypoint detector for query extraction. Defaults to YAML detector or sift.",
+        )
+        cmd.add_argument("--orb-nfeatures", type=int, default=None)
+        cmd.add_argument("--orb-scale-factor", type=float, default=None)
+        cmd.add_argument("--orb-nlevels", type=int, default=None)
+        cmd.add_argument("--orb-fast-threshold", type=int, default=None)
+        cmd.add_argument("--orb-score-type", choices=("harris", "fast"), default=None)
+        cmd.add_argument("--superpoint-model", default=None)
+        cmd.add_argument("--superpoint-max-keypoints", type=int, default=None)
+        cmd.add_argument("--superpoint-device", default=None)
+        cmd.add_argument(
+            "--superpoint-use-superglue",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help="Prefilter SuperPoint keypoints with SuperGlue cross-frame matching "
+            "(default: pure SuperPoint).",
+        )
+        cmd.add_argument("--superglue-model", default=None)
+        cmd.add_argument("--superglue-match-threshold", type=float, default=None)
+        cmd.add_argument("--superglue-neighbor-offset", type=int, default=None)
+        cmd.add_argument("--xfeat-hub-repo", default=None)
+        cmd.add_argument("--xfeat-top-k", type=int, default=None)
+        cmd.add_argument("--xfeat-device", default=None)
+        cmd.add_argument("--xfeat-checkpoint", type=Path, default=None)
 
     track = sub.add_parser("track", help="Run inverse-video point tracking.")
     _add_source_args(track)
