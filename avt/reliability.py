@@ -6,12 +6,12 @@ from typing import Any
 import numpy as np
 
 RELIABILITY_SCHEMA = "avt_frame_segment_reliability_v1"
-DEFAULT_FILTER_NAME = "stationary_sift_segment_filter"
+DEFAULT_FILTER_NAME = "stationary_query_segment_filter"
 DEFAULT_SEGMENT_SIZE_FRAMES = 40
 STOP_EXTREME_SLOW_REASON = "stop_extreme_slow_motion"
 STATIONARY_BLOCK_SIZE_PX = 6.0
 STATIONARY_SPAN_FRAMES = 10
-MIN_STATIONARY_SIFT_POINTS = 3
+MIN_STATIONARY_QUERY_POINTS = 3
 
 
 def reliability_metadata(segment_size_frames: int = DEFAULT_SEGMENT_SIZE_FRAMES) -> dict[str, Any]:
@@ -24,10 +24,10 @@ def reliability_metadata(segment_size_frames: int = DEFAULT_SEGMENT_SIZE_FRAMES)
         "rules": [
             {
                 "reason": STOP_EXTREME_SLOW_REASON,
-                "source": "sift",
+                "source": "sampled_queries",
                 "span_frames": STATIONARY_SPAN_FRAMES,
                 "block_size_px": STATIONARY_BLOCK_SIZE_PX,
-                "min_points": MIN_STATIONARY_SIFT_POINTS,
+                "min_points": MIN_STATIONARY_QUERY_POINTS,
                 "segment_mark": "disabled",
             }
         ],
@@ -53,16 +53,16 @@ def unreliable_segments(
     return {segment_id(frame, segment_size_frames) for frame in unreliable_frame_indices}
 
 
-def detect_stationary_sift_frames(
+def detect_stationary_query_frames(
     tracks: np.ndarray,
     visibility: np.ndarray,
     *,
     seq_start: int,
     seq_end: int,
-    sift_point_ids: Sequence[int],
+    query_point_ids: Sequence[int],
     block_size_px: float = STATIONARY_BLOCK_SIZE_PX,
     span_frames: int = STATIONARY_SPAN_FRAMES,
-    min_points: int = MIN_STATIONARY_SIFT_POINTS,
+    min_points: int = MIN_STATIONARY_QUERY_POINTS,
 ) -> dict[int, list[str]]:
     if span_frames <= 1:
         raise ValueError("span_frames must be greater than 1")
@@ -71,7 +71,7 @@ def detect_stationary_sift_frames(
     if min_points <= 0:
         raise ValueError("min_points must be positive")
 
-    ids = np.array(sorted({int(idx) for idx in sift_point_ids}), dtype=np.int64)
+    ids = np.array(sorted({int(idx) for idx in query_point_ids}), dtype=np.int64)
     if ids.size == 0:
         return {}
     ids = ids[(ids >= 0) & (ids < tracks.shape[1])]

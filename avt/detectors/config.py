@@ -22,7 +22,7 @@ class OrbDetectorConfig:
     score_type: str = "harris"  # "harris" or "fast"
     patch_size: int = 31
     fast_threshold: int = 20
-    use_clahe: bool = True  # reuses the SIFT CLAHE clip/tile settings
+    use_clahe: bool = True  # reuses shared sampling CLAHE clip/tile settings
 
 
 @dataclass

@@ -10,8 +10,8 @@ separate pieces:
 - `avt/inverse.py`: reversed-video windowing, query seeding, and artifact export.
 - `avt/viewer.py`: static WebUI builder that reads generic AVT artifacts.
 
-There are no runtime imports, symlinks, or path assumptions from VENTURA or any
-other local project.
+There are no runtime imports, symlinks, or path assumptions from any other local
+project.
 
 ## Install
 
@@ -36,8 +36,8 @@ avt all \
   --source-type auto \
   --backend cotracker \
   --cotracker-device cuda \
-  --query-mode ventura \
-  --robot-config configs/virtual_robot.yaml \
+  --query-mode anchor_footprint \
+  --query-config configs/anchor_footprint.yaml \
   --window-size 250 \
   --window-step 100 \
   --fps 10
@@ -76,8 +76,8 @@ avt all \
   --source-type auto \
   --backend bootstap \
   --bootstap-config configs/bootstap.yaml \
-  --query-mode ventura \
-  --robot-config configs/virtual_robot.yaml
+  --query-mode anchor_footprint \
+  --query-config configs/anchor_footprint.yaml
 ```
 
 The backend keeps AVT's query generation and artifact format unchanged. It
@@ -102,21 +102,19 @@ The checkpoint URL follows the official TAPNet PyTorch BootsTAPIR notebook:
 The TAPNet README notes that BootsTAPIR typically performs best at `512x512`,
 which is why the AVT config uses that resize by default.
 
-`--query-mode ventura` is the default. It mirrors VENTURA's image-process
-assumptions: reverse the video window, sample full-frame SIFT anchors for
-tracking stability, sample robot-footprint SIFT crumbs from a bottom-center
-percentage mask, then build the path mask from the crumb points while excluding
-the anchors. `--query-mode sift` keeps only the robot-footprint crumbs, and
-`--query-mode avt` remains as a manual deterministic seed-line fallback.
-`avt+sift` is accepted as a compatibility alias for the VENTURA anchor+crumb
-pipeline.
+`--query-mode anchor_footprint` is the default. It reverses each video window,
+samples full-frame anchors for tracking stability, samples footprint points from
+a bottom-center percentage mask, then builds the path mask from footprint points
+while excluding anchors. `--query-mode footprint` keeps only the footprint
+points, and `--query-mode avt` remains as a manual deterministic seed-line
+fallback.
 
 ### Point-Extraction Detectors
 
 The keypoint detector used to propose query points (Stage 2) is selectable with
 `--detector`, independently of `--query-mode` and `--backend`. All methods reuse
-the same VENTURA anchor/crumb masking and top-N selection; only the keypoint
-source differs. Descriptors are discarded — only locations are tracked.
+the same anchor/footprint masking and top-N selection; only the keypoint source
+differs. Descriptors are discarded — only locations are tracked.
 
 | `--detector` | Engine | Extra deps | Notes |
 |--------------|--------|-----------|-------|
@@ -145,20 +143,20 @@ with `--superpoint-device`, `--xfeat-checkpoint`, etc.):
 - SuperGlue (optional prefilter): [`magic-leap-community/superglue_outdoor`](https://huggingface.co/magic-leap-community/superglue_outdoor) — research/non-commercial license
 - XFeat: [`verlab/accelerated_features`](https://github.com/verlab/accelerated_features) via `torch.hub` (weights `xfeat.pt`)
 
-The VENTURA alignment is calibration-free. It reads the decoded frame width and
-height for each window, applies `ROBOT_WIDTH_PCT` and `ROBOT_HEIGHT_PCT` style
-percentages to a bottom-center rectangle, and records the resolved pixel bounds
-in `window.json`. It does not ask for camera intrinsics, focal length, pitch, or
+The footprint alignment is calibration-free. It reads the decoded frame width
+and height for each window, applies normalized width/height percentages to a
+bottom-center rectangle, and records the resolved pixel bounds in
+`window.json`. It does not ask for camera intrinsics, focal length, pitch, or
 accurate camera height, which keeps it usable for arbitrary internet videos.
 
-`configs/virtual_robot.yaml` now contains the default VENTURA-style parameters:
+`configs/anchor_footprint.yaml` contains the default anchor/footprint parameters:
 
 ```yaml
-query_mode: ventura
+query_mode: anchor_footprint
 footprint:
   width_ratio: 0.25
   height_ratio: 0.20
-sift:
+sampling:
   enabled: true
   max_query_points: 384
   window_size: 20
@@ -173,18 +171,18 @@ sift:
     max_points_per_frame: 20
 ```
 
-The SIFT `window_size` is VENTURA's SIFT sampling interval, separate from the
-tracking `--window-size`. The default crumb SIFT parameters are
+`sampling.window_size` is the detector sampling interval, separate from the
+tracking `--window-size`. When `--detector sift` is selected, footprint SIFT uses
 `contrastThreshold=0.018`, `edgeThreshold=20`, `nOctaveLayers=5`, `sigma=1.5`;
 anchor SIFT uses `contrastThreshold=0.008`, `edgeThreshold=15`,
-`nOctaveLayers=3`, `sigma=1.2`. Both use CLAHE before SIFT by default. Like
-VENTURA, AVT clamps each selected SIFT frame to 8-20 query points so long
-tracking windows do not become under-seeded.
+`nOctaveLayers=3`, `sigma=1.2`. CLAHE preprocessing is enabled by default. AVT
+clamps each selected sampling frame to 8-20 query points so long tracking
+windows do not become under-seeded.
 
 When `--save-path-mask` is enabled, the displayed reference-frame path mask also
-uses VENTURA-style support crumbs: extra relaxed SIFT points are sampled on the
-bottom robot footprint of the reference frame and used only to draw the mask.
-Disable support crumbs with `--no-path-support`, or tune them with
+uses support points: extra relaxed SIFT points are sampled on the bottom robot
+footprint of the reference frame and used only to draw the mask. Disable support
+points with `--no-path-support`, or tune them with
 `--path-support-min-points` and `--path-support-fraction`.
 
 By default, each CLI run writes into a fresh child directory under
@@ -220,14 +218,13 @@ avt all \
   --frames-root /path/to/recording_or_images \
   --backend foundationpose \
   --foundationpose-transforms /path/to/foundationpose_transforms.npz \
-  --query-mode ventura \
-  --robot-config configs/virtual_robot.yaml
+  --query-mode anchor_footprint \
+  --query-config configs/anchor_footprint.yaml
 ```
 
 This keeps the original CoTracker/LK pipeline intact. AVT still extracts the
-same VENTURA-aligned SIFT anchor and robot-footprint query points; the
-FoundationPose backend converts pose-derived image transforms into AVT point
-tracks.
+same anchor and footprint query points; the FoundationPose backend converts
+pose-derived image transforms into AVT point tracks.
 
 FoundationPose itself is not an RGB-only point tracker. A real FoundationPose
 run needs RGB-D frames, object masks, camera intrinsics, and CAD/reference object
@@ -293,16 +290,16 @@ Optional debug outputs are opt-in:
 - `queries`: `float32[N, 11]` as
   `[id, reverse_time, x, y, side, source_code, response, size, angle, octave, class_id]`.
 - `queries_cotracker`: `float32[N, 3]` as `[reverse_time, x, y]`, matching
-  the sparse CoTracker/VENTURA query shape.
+  the sparse CoTracker query shape.
 - `query_sides`: `int8[N]`.
 - `query_source_codes`: `int16[N]`, where `0` is fixed AVT seeds, `1` is
-  VENTURA robot-footprint SIFT crumbs, and `2` is full-frame SIFT anchors.
-- `query_records_json`: rich per-query metadata, including source and SIFT
-  keypoint fields when available.
+  footprint points, and `2` is full-frame anchors.
+- `query_records_json`: rich per-query metadata, including source and keypoint
+  fields when available.
 
 `window.json` also stores `query_capture.image_alignment`, including the input
 window resolution, pixel footprint bounds, normalized seed ratios, and the
-`ventura_pct_bottom_center` alignment method.
+`bottom_center_footprint` alignment method.
 
 Any future tracker can plug in by returning a `TrackingBundle` with the same
 `tracks` and `visibility` shapes.

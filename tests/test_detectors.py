@@ -23,7 +23,7 @@ from avt.detectors.superpoint import SuperPointSuperGlueDetector
 from avt.detectors.xfeat import XFeatDetector
 from avt.inverse import build_queries, run_inverse_tracking
 from avt.io import read_frame_records
-from avt.querying import QueryConfig, SiftCaptureConfig, VirtualRobotConfig, robot_sift_mask
+from avt.querying import FootprintConfig, QueryConfig, QuerySamplingConfig, robot_footprint_mask
 from avt.schema import QueryPoint, TrackerInfo
 from avt.tracking.base import TrackingBundle
 
@@ -71,7 +71,7 @@ def _torch_available() -> bool:
 def test_sift_detector_matches_raw_sift() -> None:
     """SiftDetector must reproduce the exact prior inline SIFT path."""
     frames = _textured_frames(2)
-    cfg = SiftCaptureConfig()
+    cfg = QuerySamplingConfig()
     kps = SiftDetector(cfg, cfg).detect(frames, 0, None)
 
     gray = cv2.cvtColor(frames[0], cv2.COLOR_RGB2GRAY)
@@ -109,16 +109,16 @@ def test_orb_build_queries_within_footprint() -> None:
     # Roomy footprint without edge-carving so ORB's 31px patch fits inside the mask.
     config = InverseTrackConfig(
         query_config=QueryConfig(
-            mode="sift",
+            mode="footprint",
             detector="orb",
-            robot=VirtualRobotConfig(width_ratio=0.6, height_ratio=0.5),
-            sift=SiftCaptureConfig(sample_at_edges=False),
+            footprint=FootprintConfig(width_ratio=0.6, height_ratio=0.5),
+            sampling=QuerySamplingConfig(sample_at_edges=False),
         )
     )
     queries = build_queries(w, h, len(frames), config, frames_rgb=frames)
     assert queries
-    assert all(q.source == "sift_robot" for q in queries)
-    mask = robot_sift_mask(h, w, config.query_config.robot, config.query_config.sift)
+    assert all(q.source == "footprint" for q in queries)
+    mask = robot_footprint_mask(h, w, config.query_config.footprint, config.query_config.sampling)
     for q in queries:
         assert mask[int(round(q.y)), int(round(q.x))] > 0
         assert q.response is not None  # ORB Harris score recorded
@@ -134,8 +134,8 @@ def test_build_detector_dispatch() -> None:
     }
     for name, cls in expected.items():
         cfg = replace(base, detector=name)
-        assert isinstance(build_detector(cfg, base.sift), cls)
-    _assert_raises(ValueError, "Unknown detector", build_detector, replace(base, detector="nope"))
+        assert isinstance(build_detector(cfg, base.sampling), cls)
+    _assert_raises(ValueError, "detector must be one of", lambda: replace(base, detector="nope"))
 
 
 def test_learned_detectors_install_hint_without_torch() -> None:
@@ -156,7 +156,7 @@ def test_orb_end_to_end_run(tmp_path: Path) -> None:
         window_size=6,
         window_step=6,
         max_windows=1,
-        query_config=QueryConfig(mode="ventura", detector="orb"),
+        query_config=QueryConfig(mode="anchor_footprint", detector="orb"),
     )
     windows = run_inverse_tracking(frames_root, records, tmp_path / "out", FakeTracker(), config)
     window_dir = tmp_path / "out" / "windows" / windows[0].id

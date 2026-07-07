@@ -14,7 +14,7 @@ from .base import TrackingBundle
 class CoTrackerBackend:
     """CoTracker backend behind the generic AVT point-tracker interface.
 
-    This backend has no dependency on VENTURA paths or artifacts. It expects
+    This backend has no dependency on query-capture paths or artifacts. It expects
     PyTorch plus a CoTracker hub-capable environment at runtime.
     """
 

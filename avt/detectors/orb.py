@@ -15,7 +15,7 @@ import numpy as np
 from .config import OrbDetectorConfig
 
 if TYPE_CHECKING:
-    from ..querying import SiftCaptureConfig
+    from ..querying import QuerySamplingConfig
 
 _SCORE_TYPES = {
     "harris": cv2.ORB_HARRIS_SCORE,
@@ -27,10 +27,10 @@ class OrbDetector:
     def __init__(
         self,
         config: OrbDetectorConfig,
-        sift_config: "SiftCaptureConfig | None" = None,
+        sampling_config: "QuerySamplingConfig | None" = None,
     ) -> None:
         self._config = config
-        self._sift_config = sift_config
+        self._sampling_config = sampling_config
         self._detector = cv2.ORB_create(
             nfeatures=int(config.nfeatures),
             scaleFactor=float(config.scale_factor),
@@ -52,12 +52,12 @@ class OrbDetector:
         return list(keypoints) if keypoints else []
 
     def _maybe_equalize(self, gray: np.ndarray) -> np.ndarray:
-        sc = self._sift_config
-        if not self._config.use_clahe or sc is None or not sc.use_clahe:
+        sampling = self._sampling_config
+        if not self._config.use_clahe or sampling is None or not sampling.use_clahe:
             return gray
-        tile = max(1, int(sc.clahe_tile_grid_size))
+        tile = max(1, int(sampling.clahe_tile_grid_size))
         clahe = cv2.createCLAHE(
-            clipLimit=float(sc.clahe_clip_limit),
+            clipLimit=float(sampling.clahe_clip_limit),
             tileGridSize=(tile, tile),
         )
         return clahe.apply(gray)

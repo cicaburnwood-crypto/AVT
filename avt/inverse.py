@@ -18,7 +18,7 @@ from .pipeline.combine import (
     reference_mask,
     write_window_artifacts,
 )
-from .pipeline.extract import PointExtractor, SiftQueryExtractor, build_queries
+from .pipeline.extract import PointExtractor, QueryPointExtractor, build_queries
 from .pipeline.preprocess import (
     PreparedWindow,
     _avt_seed_ratios,
@@ -33,7 +33,7 @@ __all__ = [
     "InverseTrackConfig",
     "PreparedWindow",
     "PointExtractor",
-    "SiftQueryExtractor",
+    "QueryPointExtractor",
     "build_windows",
     "prepare_window",
     "build_queries",
@@ -52,7 +52,7 @@ def run_inverse_tracking(
     *,
     extractor: PointExtractor | None = None,
 ) -> list[WindowSpec]:
-    extractor = extractor or SiftQueryExtractor()
+    extractor = extractor or QueryPointExtractor()
     source_root = source_root.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     windows = build_windows(len(frame_records), config)

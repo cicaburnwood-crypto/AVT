@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from .io import link_or_copy
-from .reliability import detect_stationary_sift_frames, frame_reliability, reliability_metadata
+from .reliability import detect_stationary_query_frames, frame_reliability, reliability_metadata
 from .schema import FrameRecord
 
 
@@ -84,13 +84,15 @@ def _window_payload(
         int(row[0]): str(query_records.get(int(row[0]), {}).get("source") or _query_source_from_row(row))
         for row in queries
     }
-    sift_point_ids = [idx for idx, source in query_sources.items() if source.startswith("sift_")]
-    frame_reasons = detect_stationary_sift_frames(
+    sampled_point_ids = [
+        idx for idx, source in query_sources.items() if source in {"anchor", "footprint"}
+    ]
+    frame_reasons = detect_stationary_query_frames(
         tracks,
         visibility,
         seq_start=seq_start,
         seq_end=seq_end,
-        sift_point_ids=sift_point_ids,
+        query_point_ids=sampled_point_ids,
     )
     unreliable_frame_indices = sorted(frame_reasons)
 
@@ -191,7 +193,7 @@ def _query_records(arrays: np.lib.npyio.NpzFile) -> dict[int, dict[str, Any]]:
 def _query_source_from_row(row: np.ndarray) -> str:
     if len(row) < 6 or not np.isfinite(row[5]):
         return "avt"
-    return {0: "avt", 1: "sift_robot", 2: "sift_anchor"}.get(int(row[5]), "unknown")
+    return {0: "avt", 1: "footprint", 2: "anchor"}.get(int(row[5]), "unknown")
 
 
 def build_payload(
@@ -597,7 +599,7 @@ function imageToCanvas(pt, fit) {
 }
 
 function pointColor(crumb) {
-  if (crumb.source === "sift_anchor") return "#10b981";
+  if (crumb.source === "anchor") return "#10b981";
   return crumb.side < 0 ? "#3b82f6" : "#f5b84b";
 }
 
@@ -927,7 +929,7 @@ function drawPathOverlay(trackSets, fit) {
     if (!tracks) return;
     tracks.points.forEach((point) => {
       const crumb = win._crumbMap.get(point[0]);
-      if (!crumb || crumb.source === "sift_anchor") return;
+      if (!crumb || crumb.source === "anchor") return;
       const [cx, cy] = imageToCanvas([point[1], point[2]], fit);
       const entry = { cx, cy };
       robotPoints.push(entry);
@@ -1321,17 +1323,17 @@ function computeWindowReliability(win, settings = reliabilitySettings) {
   if (win._reliabilityCache && win._reliabilityCache.key === key) return win._reliabilityCache;
 
   const pointMaps = ensurePointMaps(win);
-  const siftIds = win.crumbs
-    .filter((crumb) => String(crumb.source || "").startsWith("sift_"))
+  const sampledIds = win.crumbs
+    .filter((crumb) => ["anchor", "footprint"].includes(String(crumb.source || "")))
     .map((crumb) => Number(crumb.id));
   const frameReasons = new Map();
   const disabledSegments = new Map();
-  if (siftIds.length) {
+  if (sampledIds.length) {
     const firstFrame = Number(win.seq_start) + settings.spanFrames - 1;
     const lastFrame = Number(win.seq_end) - 1;
     for (let frame = firstFrame; frame <= lastFrame; frame += 1) {
       let stationaryCount = 0;
-      for (const id of siftIds) {
+      for (const id of sampledIds) {
         let minX = Infinity;
         let minY = Infinity;
         let maxX = -Infinity;
@@ -1389,7 +1391,7 @@ function frameReliability(win, index, settings = reliabilitySettings) {
   });
   return {
     schema: "avt_frame_segment_reliability_v1",
-    filter: "stationary_sift_segment_filter",
+    filter: "stationary_query_segment_filter",
     action: "client_live",
     segment_size_frames: settings.segmentSizeFrames,
     segment_id: segmentId,
@@ -1558,7 +1560,7 @@ function imageToCanvas(pt, fit) {
 }
 
 function pointColor(crumb) {
-  if (crumb.source === "sift_anchor") return "#10b981";
+  if (crumb.source === "anchor") return "#10b981";
   return crumb.side < 0 ? "#3b82f6" : "#f5b84b";
 }
 
@@ -1888,7 +1890,7 @@ function drawPathOverlay(trackSets, fit) {
     if (!tracks) return;
     tracks.points.forEach((point) => {
       const crumb = win._crumbMap.get(point[0]);
-      if (!crumb || crumb.source === "sift_anchor") return;
+      if (!crumb || crumb.source === "anchor") return;
       const [cx, cy] = imageToCanvas([point[1], point[2]], fit);
       const entry = { cx, cy };
       robotPoints.push(entry);

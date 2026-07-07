@@ -15,20 +15,20 @@ from avt.cli import (
 from avt.inverse import InverseTrackConfig, build_queries, reference_mask, run_inverse_tracking
 from avt.io import read_frame_records
 from avt.querying import (
+    AnchorSamplingConfig,
+    FootprintConfig,
     QueryConfig,
-    SiftAnchorConfig,
-    SiftCaptureConfig,
-    VirtualRobotConfig,
-    align_virtual_robot_to_image,
+    QuerySamplingConfig,
+    align_footprint_to_image,
     query_artifact_arrays,
     query_config_from_mapping,
-    robot_sift_mask,
+    robot_footprint_mask,
 )
 from avt.reliability import (
     STATIONARY_BLOCK_SIZE_PX,
     STATIONARY_SPAN_FRAMES,
     STOP_EXTREME_SLOW_REASON,
-    detect_stationary_sift_frames,
+    detect_stationary_query_frames,
     frame_reliability,
     segment_bounds,
     unreliable_segments,
@@ -71,28 +71,28 @@ def test_build_queries() -> None:
     config = InverseTrackConfig(
         query_stride=2,
         seed_count=3,
-        query_config=QueryConfig(mode="avt", sift=SiftCaptureConfig(enabled=False)),
+        query_config=QueryConfig(mode="avt", sampling=QuerySamplingConfig(enabled=False)),
     )
     queries = build_queries(width=100, height=80, frame_count=5, config=config)
     assert [q.reverse_time for q in queries] == [0, 0, 0, 2, 2, 2, 4, 4, 4]
     assert [q.id for q in queries] == list(range(9))
 
 
-def test_build_ventura_anchor_and_crumb_queries() -> None:
+def test_build_anchor_footprint_queries() -> None:
     rng = np.random.default_rng(7)
     frames = rng.integers(0, 255, size=(8, 96, 128, 3), dtype=np.uint8)
 
     config = InverseTrackConfig(
         query_config=QueryConfig(
-            mode="ventura",
-            robot=VirtualRobotConfig(width_ratio=0.60, height_ratio=0.35),
-            sift=SiftCaptureConfig(
+            mode="anchor_footprint",
+            footprint=FootprintConfig(width_ratio=0.60, height_ratio=0.35),
+            sampling=QuerySamplingConfig(
                 enabled=True,
                 max_query_points=16,
                 window_size=4,
                 edge_offset_ratio=0.25,
                 contrast_threshold=0.001,
-                anchors=SiftAnchorConfig(
+                anchors=AnchorSamplingConfig(
                     enabled=True,
                     max_query_points=16,
                     window_size=4,
@@ -105,23 +105,23 @@ def test_build_ventura_anchor_and_crumb_queries() -> None:
     queries = build_queries(128, 96, len(frames), config, frames_rgb=frames)
     arrays = query_artifact_arrays(queries)
 
-    assert {query.source for query in queries} == {"sift_anchor", "sift_robot"}
+    assert {query.source for query in queries} == {"anchor", "footprint"}
     assert "avt" not in {query.source for query in queries}
     assert [query.id for query in queries] == list(range(len(queries)))
-    first_robot = next(idx for idx, query in enumerate(queries) if query.source == "sift_robot")
-    assert all(query.source == "sift_anchor" for query in queries[:first_robot])
-    assert all(query.source == "sift_robot" for query in queries[first_robot:])
+    first_footprint = next(idx for idx, query in enumerate(queries) if query.source == "footprint")
+    assert all(query.source == "anchor" for query in queries[:first_footprint])
+    assert all(query.source == "footprint" for query in queries[first_footprint:])
     assert arrays["queries"].shape[1] == 11
     assert arrays["queries_cotracker"].shape == (len(queries), 3)
     assert set(arrays["query_source_codes"].tolist()) == {1, 2}
 
 
-def test_ventura_pct_mask_edges() -> None:
-    mask = robot_sift_mask(
+def test_bottom_center_footprint_mask_edges() -> None:
+    mask = robot_footprint_mask(
         100,
         200,
-        VirtualRobotConfig(width_ratio=0.20, height_ratio=0.20),
-        SiftCaptureConfig(edge_offset_ratio=0.25),
+        FootprintConfig(width_ratio=0.20, height_ratio=0.20),
+        QuerySamplingConfig(edge_offset_ratio=0.25),
     )
 
     assert mask[90, 85] == 255
@@ -130,13 +130,13 @@ def test_ventura_pct_mask_edges() -> None:
     assert mask[79, 85] == 0
 
 
-def test_virtual_robot_alignment_auto_detects_resolution() -> None:
-    robot = VirtualRobotConfig(width_ratio=0.20, height_ratio=0.15)
+def test_footprint_alignment_auto_detects_resolution() -> None:
+    robot = FootprintConfig(width_ratio=0.20, height_ratio=0.15)
 
-    low_res = align_virtual_robot_to_image(height=720, width=1280, robot=robot)
-    wide_res = align_virtual_robot_to_image(height=1080, width=1920, robot=robot)
+    low_res = align_footprint_to_image(height=720, width=1280, robot=robot)
+    wide_res = align_footprint_to_image(height=1080, width=1920, robot=robot)
 
-    assert low_res.method == "ventura_pct_bottom_center"
+    assert low_res.method == "bottom_center_footprint"
     assert low_res.frame_width == 1280
     assert low_res.frame_height == 720
     assert 0 <= low_res.left < low_res.right <= 1280
@@ -152,12 +152,12 @@ def test_virtual_robot_alignment_auto_detects_resolution() -> None:
 def test_query_config_from_yaml_mapping() -> None:
     config = query_config_from_mapping(
         {
-            "query_mode": "ventura",
+            "query_mode": "anchor_footprint",
             "footprint": {
                 "width_ratio": 0.25,
                 "height_ratio": 0.20,
             },
-            "sift": {
+            "sampling": {
                 "enabled": True,
                 "max_query_points": 384,
                 "window_size": 20,
@@ -169,14 +169,14 @@ def test_query_config_from_yaml_mapping() -> None:
         }
     )
 
-    assert config.mode == "ventura"
-    assert config.robot.width_ratio == 0.25
-    assert config.robot.height_ratio == 0.20
-    assert config.sift.max_query_points == 384
-    assert config.sift.window_size == 20
-    assert config.sift.min_points_per_frame == 8
-    assert config.sift.max_points_per_frame == 20
-    assert config.sift.anchors.max_query_points == 192
+    assert config.mode == "anchor_footprint"
+    assert config.footprint.width_ratio == 0.25
+    assert config.footprint.height_ratio == 0.20
+    assert config.sampling.max_query_points == 384
+    assert config.sampling.window_size == 20
+    assert config.sampling.min_points_per_frame == 8
+    assert config.sampling.max_points_per_frame == 20
+    assert config.sampling.anchors.max_query_points == 192
 
 
 def test_create_unique_run_dir(tmp_path: Path) -> None:
@@ -392,7 +392,7 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
         seed_count=3,
         max_windows=1,
         save_reverse_video=False,
-        query_config=QueryConfig(mode="avt", sift=SiftCaptureConfig(enabled=False)),
+        query_config=QueryConfig(mode="avt", sampling=QuerySamplingConfig(enabled=False)),
     )
     windows = run_inverse_tracking(frames_root, records, output_root, FakeTracker(), config)
     assert len(windows) == 1
@@ -444,7 +444,7 @@ def test_reliability_marks_40_frame_segment() -> None:
     assert next_segment["segment_unreliable"] is False
 
 
-def test_stationary_sift_points_disable_segment() -> None:
+def test_stationary_sampled_points_disable_segment() -> None:
     tracks = np.zeros((12, 4, 2), dtype=np.float32)
     visibility = np.ones((12, 4), dtype=bool)
     for reverse_t in range(12):
@@ -459,12 +459,12 @@ def test_stationary_sift_points_disable_segment() -> None:
             [15 + offset, 15 + offset],
         ]
 
-    reasons = detect_stationary_sift_frames(
+    reasons = detect_stationary_query_frames(
         tracks,
         visibility,
         seq_start=0,
         seq_end=12,
-        sift_point_ids=[0, 1, 2],
+        query_point_ids=[0, 1, 2],
     )
     assert STATIONARY_SPAN_FRAMES == 10
     assert STATIONARY_BLOCK_SIZE_PX == 6.0

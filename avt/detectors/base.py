@@ -2,7 +2,7 @@
 
 Every detector proposes keypoint *locations* (descriptors are discarded - the
 tracker does the tracking). To maximize reuse, all detectors return
-``list[cv2.KeyPoint]`` so the existing top-N picking (`_pick_sift_keypoints`)
+``list[cv2.KeyPoint]`` so the existing top-N picking (`_pick_top_keypoints`)
 and ``QueryPoint`` construction in ``querying.py`` work unchanged.
 """
 

@@ -67,15 +67,15 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--query-mode",
-        choices=("ventura", "avt", "sift", "avt+sift"),
+        choices=("anchor_footprint", "footprint", "avt", "avt+footprint"),
         default=None,
-        help="Query source mode. Defaults to YAML query_mode or ventura.",
+        help="Query source mode. Defaults to YAML query_mode or anchor_footprint.",
     )
     parser.add_argument(
-        "--robot-config",
+        "--query-config",
         type=Path,
         default=None,
-        help="YAML file with VENTURA footprint and SIFT query-capture settings.",
+        help="YAML file with footprint, sampling, and detector settings.",
     )
     parser.add_argument("--max-windows", type=int, default=None)
     parser.add_argument(
@@ -99,7 +99,7 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
         "--path-support",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Use VENTURA-style relaxed SIFT support points when drawing the reference path mask.",
+        help="Use relaxed support points when drawing the reference path mask.",
     )
     parser.add_argument("--path-support-min-points", type=int, default=32)
     parser.add_argument("--path-support-fraction", type=int, default=6)
@@ -113,8 +113,8 @@ def _override(base, **kwargs):
 
 def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
     query_config = (
-        load_query_config_yaml(args.robot_config)
-        if args.robot_config
+        load_query_config_yaml(args.query_config)
+        if args.query_config
         else QueryConfig()
     )
     orb = _override(

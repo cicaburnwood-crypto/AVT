@@ -1,7 +1,7 @@
 """Stage 4 - combine.
 
 Combines tracked trajectories into the per-window outputs: the convex-hull
-reference mask, optional SIFT support points, and the serialized ``tracks.npz``
+reference mask, optional support points, and the serialized ``tracks.npz``
 / ``window.json`` artifacts. Behavior and file formats are unchanged.
 """
 
@@ -17,9 +17,10 @@ import numpy as np
 from ..config import InverseTrackConfig
 from ..io import write_mp4
 from ..querying import (
+    DETECTOR_SAMPLING_MODES,
     query_artifact_arrays,
     query_capture_metadata,
-    robot_sift_mask,
+    robot_footprint_mask,
 )
 from ..schema import QueryPoint, WindowSpec
 from ..tracking.base import TrackingBundle
@@ -39,7 +40,7 @@ def reference_mask(
         point_indices = np.arange(bundle.tracks.shape[1])
     else:
         point_indices = np.array(
-            [query.id for query in queries if query.source != "sift_anchor"],
+            [query.id for query in queries if query.source != "anchor"],
             dtype=np.int64,
         )
     if point_indices.size:
@@ -69,21 +70,21 @@ def reference_mask(
 def _reference_support_points(frame_rgb: np.ndarray, config: InverseTrackConfig) -> np.ndarray:
     if not config.path_support_enabled:
         return np.empty((0, 2), dtype=np.float32)
-    if config.query_config.mode not in {"ventura", "sift", "avt+sift"}:
+    if config.query_config.mode not in DETECTOR_SAMPLING_MODES:
         return np.empty((0, 2), dtype=np.float32)
     if config.path_support_min_points <= 0:
         return np.empty((0, 2), dtype=np.float32)
 
     h, w = frame_rgb.shape[:2]
-    max_query_points = max(1, int(config.query_config.sift.max_query_points))
+    max_query_points = max(1, int(config.query_config.sampling.max_query_points))
     fraction = max(1, int(config.path_support_fraction))
     count = max(int(config.path_support_min_points), max_query_points // fraction)
-    mask = robot_sift_mask(h, w, config.query_config.robot, config.query_config.sift)
+    mask = robot_footprint_mask(h, w, config.query_config.footprint, config.query_config.sampling)
     gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-    if config.query_config.sift.use_clahe:
-        tile = max(1, int(config.query_config.sift.clahe_tile_grid_size))
+    if config.query_config.sampling.use_clahe:
+        tile = max(1, int(config.query_config.sampling.clahe_tile_grid_size))
         clahe = cv2.createCLAHE(
-            clipLimit=float(config.query_config.sift.clahe_clip_limit),
+            clipLimit=float(config.query_config.sampling.clahe_clip_limit),
             tileGridSize=(tile, tile),
         )
         gray = clahe.apply(gray)
@@ -164,7 +165,8 @@ def write_window_artifacts(
             "point_count": int(len(support_points)),
             "min_points": int(config.path_support_min_points),
             "fraction": int(config.path_support_fraction),
-            "sift": {
+            "support_detector": {
+                "name": "sift",
                 "contrast_threshold": 0.006,
                 "edge_threshold": 24.0,
                 "n_octave_layers": 4,

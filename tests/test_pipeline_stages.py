@@ -14,9 +14,9 @@ import numpy as np
 from avt.config import InverseTrackConfig
 from avt.inverse import build_queries, run_inverse_tracking
 from avt.io import read_frame_records
-from avt.pipeline import PreparedWindow, SiftQueryExtractor
+from avt.pipeline import PreparedWindow, QueryPointExtractor
 from avt.pipeline.preprocess import build_windows, prepare_window
-from avt.querying import QueryConfig, SiftCaptureConfig
+from avt.querying import QueryConfig, QuerySamplingConfig
 from avt.schema import QueryPoint, TrackerInfo, WindowSpec
 from avt.tracking.base import TrackingBundle
 
@@ -61,7 +61,7 @@ def _avt_config() -> InverseTrackConfig:
         query_stride=2,
         seed_count=3,
         max_windows=1,
-        query_config=QueryConfig(mode="avt", sift=SiftCaptureConfig(enabled=False)),
+        query_config=QueryConfig(mode="avt", sampling=QuerySamplingConfig(enabled=False)),
     )
 
 
@@ -86,14 +86,14 @@ def test_build_windows_matches_config(tmp_path: Path) -> None:
     assert (windows[0].start, windows[0].end) == (0, 4)
 
 
-def test_sift_extractor_matches_build_queries(tmp_path: Path) -> None:
+def test_query_point_extractor_matches_build_queries(tmp_path: Path) -> None:
     frames_root = tmp_path / "frames"
     write_frames(frames_root)
     records = read_frame_records(frames_root, "image_dir")
     config = _avt_config()
     prepared = prepare_window(frames_root.resolve(), records, WindowSpec(start=0, end=4), config)
 
-    via_extractor = SiftQueryExtractor().extract(prepared, config)
+    via_extractor = QueryPointExtractor().extract(prepared, config)
     via_function = build_queries(
         prepared.width,
         prepared.height,

@@ -15,7 +15,7 @@ import numpy as np
 
 from ..config import InverseTrackConfig
 from ..io import load_frame_window
-from ..querying import align_virtual_robot_to_image
+from ..querying import align_footprint_to_image
 from ..schema import FrameRecord, WindowSpec
 
 
@@ -49,10 +49,10 @@ def build_windows(frame_count: int, config: InverseTrackConfig) -> list[WindowSp
 def _avt_seed_ratios(
     config: InverseTrackConfig, width: int, height: int
 ) -> tuple[float, float, float]:
-    alignment = align_virtual_robot_to_image(
+    alignment = align_footprint_to_image(
         height=height,
         width=width,
-        robot=config.query_config.robot,
+        robot=config.query_config.footprint,
     )
     return (
         alignment.seed_y_ratio if config.seed_y_ratio is None else config.seed_y_ratio,

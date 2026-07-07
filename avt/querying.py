@@ -13,11 +13,13 @@ from .detectors.config import OrbDetectorConfig, SuperPointConfig, XFeatConfig
 from .schema import QueryPoint
 
 
-QUERY_SOURCE_CODES = {
+PRIMARY_QUERY_SOURCE_CODES = {
     "avt": 0,
-    "sift_robot": 1,
-    "sift_anchor": 2,
+    "footprint": 1,
+    "anchor": 2,
 }
+
+QUERY_SOURCE_CODES = PRIMARY_QUERY_SOURCE_CODES
 
 QUERY_NUMERIC_COLUMNS = [
     "id",
@@ -35,8 +37,8 @@ QUERY_NUMERIC_COLUMNS = [
 
 
 @dataclass
-class VirtualRobotConfig:
-    """VENTURA-style bottom-center robot footprint in normalized image units."""
+class FootprintConfig:
+    """Bottom-center robot footprint in normalized image units."""
 
     width_ratio: float = 0.25
     height_ratio: float = 0.20
@@ -79,8 +81,8 @@ class RobotImageAlignment:
 
 
 @dataclass
-class SiftAnchorConfig:
-    """VENTURA full-frame SIFT anchors used to stabilize tracking."""
+class AnchorSamplingConfig:
+    """Full-frame anchor sampling controls used to stabilize tracking."""
 
     enabled: bool = True
     max_query_points: int = 384
@@ -94,8 +96,8 @@ class SiftAnchorConfig:
 
 
 @dataclass
-class SiftCaptureConfig:
-    """VENTURA SIFT query capture controls."""
+class QuerySamplingConfig:
+    """Detector-agnostic query sampling controls."""
 
     enabled: bool = True
     max_query_points: int = 384
@@ -111,26 +113,37 @@ class SiftCaptureConfig:
     use_clahe: bool = True
     clahe_clip_limit: float = 2.0
     clahe_tile_grid_size: int = 8
-    anchors: SiftAnchorConfig = field(default_factory=SiftAnchorConfig)
+    anchors: AnchorSamplingConfig = field(default_factory=AnchorSamplingConfig)
 
-    @property
-    def temporal_stride(self) -> int:
-        """Compatibility alias for older AVT configs; VENTURA calls this window_size."""
-
-        return self.window_size
-
-
-@dataclass
+@dataclass(init=False)
 class QueryConfig:
     """Top-level query source configuration."""
 
-    mode: str = "ventura"
+    mode: str = "anchor_footprint"
     detector: str = "sift"
-    robot: VirtualRobotConfig = field(default_factory=VirtualRobotConfig)
-    sift: SiftCaptureConfig = field(default_factory=SiftCaptureConfig)
+    footprint: FootprintConfig = field(default_factory=FootprintConfig)
+    sampling: QuerySamplingConfig = field(default_factory=QuerySamplingConfig)
     orb: OrbDetectorConfig = field(default_factory=OrbDetectorConfig)
     superpoint: SuperPointConfig = field(default_factory=SuperPointConfig)
     xfeat: XFeatConfig = field(default_factory=XFeatConfig)
+
+    def __init__(
+        self,
+        mode: str = "anchor_footprint",
+        detector: str = "sift",
+        footprint: FootprintConfig | None = None,
+        sampling: QuerySamplingConfig | None = None,
+        orb: OrbDetectorConfig | None = None,
+        superpoint: SuperPointConfig | None = None,
+        xfeat: XFeatConfig | None = None,
+    ) -> None:
+        self.mode = _validate_mode(mode)
+        self.detector = _validate_detector(detector)
+        self.footprint = footprint if footprint is not None else FootprintConfig()
+        self.sampling = sampling if sampling is not None else QuerySamplingConfig()
+        self.orb = orb if orb is not None else OrbDetectorConfig()
+        self.superpoint = superpoint if superpoint is not None else SuperPointConfig()
+        self.xfeat = xfeat if xfeat is not None else XFeatConfig()
 
 
 def load_query_config_yaml(path: Path) -> QueryConfig:
@@ -147,6 +160,8 @@ def load_query_config_yaml(path: Path) -> QueryConfig:
 
 
 _DETECTORS = ("sift", "orb", "superpoint", "xfeat")
+QUERY_MODES = ("anchor_footprint", "footprint", "avt", "avt+footprint")
+DETECTOR_SAMPLING_MODES = ("anchor_footprint", "footprint", "avt+footprint")
 
 
 def _validate_detector(name: str) -> str:
@@ -204,36 +219,30 @@ def _xfeat_config_from_mapping(data: dict[str, Any]) -> XFeatConfig:
 
 
 def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
-    mode = str(data.get("query_mode", data.get("mode", "ventura")))
-    robot_data = (
-        data.get("footprint")
-        or data.get("ventura_footprint")
-        or data.get("virtual_robot")
-        or data.get("robot")
-        or {}
-    )
-    sift_data = data.get("sift", data.get("sift_capture", {})) or {}
+    mode = _validate_mode(str(data.get("query_mode", data.get("mode", "anchor_footprint"))))
+    robot_data = data.get("footprint", {}) or {}
+    sampling_data = data.get("sampling", {}) or {}
     if not isinstance(robot_data, dict):
         raise ValueError("footprint must be a mapping")
-    if not isinstance(sift_data, dict):
-        raise ValueError("sift must be a mapping")
-    anchor_data = sift_data.get("anchors", sift_data.get("anchor", {})) or {}
+    if not isinstance(sampling_data, dict):
+        raise ValueError("sampling must be a mapping")
+    anchor_data = sampling_data.get("anchors", sampling_data.get("anchor", {})) or {}
     if not isinstance(anchor_data, dict):
-        raise ValueError("sift.anchors must be a mapping")
+        raise ValueError("sampling.anchors must be a mapping")
 
-    robot = VirtualRobotConfig(
+    footprint = FootprintConfig(
         width_ratio=_ratio_value(
             robot_data,
-            ("width_ratio", "robot_width_pct", "footprint_width_ratio"),
+            ("width_ratio",),
             0.25,
         ),
         height_ratio=_ratio_value(
             robot_data,
-            ("height_ratio", "robot_height_pct", "footprint_height_ratio", "footprint_length_ratio"),
+            ("height_ratio",),
             0.20,
         ),
     )
-    anchors = SiftAnchorConfig(
+    anchors = AnchorSamplingConfig(
         enabled=_as_bool(anchor_data.get("enabled", True)),
         max_query_points=int(anchor_data.get("max_query_points", 384)),
         window_size=(
@@ -248,28 +257,27 @@ def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
         edge_threshold=float(anchor_data.get("edge_threshold", 15.0)),
         sigma=float(anchor_data.get("sigma", 1.2)),
     )
-    sift = SiftCaptureConfig(
-        enabled=_as_bool(sift_data.get("enabled", mode in {"ventura", "sift", "avt+sift"})),
-        max_query_points=int(sift_data.get("max_query_points", 384)),
-        window_size=int(sift_data.get("window_size", sift_data.get("temporal_stride", 20))),
-        min_points_per_frame=int(sift_data.get("min_points_per_frame", 8)),
-        max_points_per_frame=int(sift_data.get("max_points_per_frame", 20)),
-        sample_at_edges=_as_bool(sift_data.get("sample_at_edges", True)),
-        edge_offset_ratio=float(sift_data.get("edge_offset_ratio", 0.10)),
-        n_octave_layers=int(sift_data.get("n_octave_layers", 5)),
-        contrast_threshold=float(sift_data.get("contrast_threshold", 0.018)),
-        edge_threshold=float(sift_data.get("edge_threshold", 20.0)),
-        sigma=float(sift_data.get("sigma", 1.5)),
-        use_clahe=_as_bool(sift_data.get("use_clahe", True)),
-        clahe_clip_limit=float(sift_data.get("clahe_clip_limit", 2.0)),
-        clahe_tile_grid_size=int(sift_data.get("clahe_tile_grid_size", 8)),
+    sampling = QuerySamplingConfig(
+        enabled=_as_bool(sampling_data.get("enabled", mode in DETECTOR_SAMPLING_MODES)),
+        max_query_points=int(sampling_data.get("max_query_points", 384)),
+        window_size=int(sampling_data.get("window_size", 20)),
+        min_points_per_frame=int(sampling_data.get("min_points_per_frame", 8)),
+        max_points_per_frame=int(sampling_data.get("max_points_per_frame", 20)),
+        sample_at_edges=_as_bool(sampling_data.get("sample_at_edges", True)),
+        edge_offset_ratio=float(sampling_data.get("edge_offset_ratio", 0.10)),
+        n_octave_layers=int(sampling_data.get("n_octave_layers", 5)),
+        contrast_threshold=float(sampling_data.get("contrast_threshold", 0.018)),
+        edge_threshold=float(sampling_data.get("edge_threshold", 20.0)),
+        sigma=float(sampling_data.get("sigma", 1.5)),
+        use_clahe=_as_bool(sampling_data.get("use_clahe", True)),
+        clahe_clip_limit=float(sampling_data.get("clahe_clip_limit", 2.0)),
+        clahe_tile_grid_size=int(sampling_data.get("clahe_tile_grid_size", 8)),
         anchors=anchors,
     )
-    mode = _validate_mode(mode)
-    if mode in {"ventura", "sift", "avt+sift"} and not sift.enabled:
-        sift = replace(sift, enabled=True)
-    if sift.enabled and mode == "avt":
-        mode = "ventura"
+    if mode in DETECTOR_SAMPLING_MODES and not sampling.enabled:
+        sampling = replace(sampling, enabled=True)
+    if sampling.enabled and mode == "avt":
+        mode = "anchor_footprint"
     detector = _validate_detector(str(data.get("detector", "sift")))
     orb = _orb_config_from_mapping(data.get("orb", {}) or {})
     superpoint = _superpoint_config_from_mapping(data.get("superpoint", {}) or {})
@@ -277,8 +285,8 @@ def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
     return QueryConfig(
         mode=mode,
         detector=detector,
-        robot=robot,
-        sift=sift,
+        footprint=footprint,
+        sampling=sampling,
         orb=orb,
         superpoint=superpoint,
         xfeat=xfeat,
@@ -289,26 +297,26 @@ def merge_query_config(
     base: QueryConfig,
     *,
     mode: str | None = None,
-    enable_sift: bool | None = None,
+    enable_sampling: bool | None = None,
     detector: str | None = None,
     orb: OrbDetectorConfig | None = None,
     superpoint: SuperPointConfig | None = None,
     xfeat: XFeatConfig | None = None,
 ) -> QueryConfig:
     next_mode = _validate_mode(mode) if mode else base.mode
-    next_sift = base.sift
-    if mode in {"ventura", "sift", "avt+sift"} and not next_sift.enabled:
-        next_sift = replace(next_sift, enabled=True)
-    if enable_sift is not None:
-        next_sift = replace(next_sift, enabled=enable_sift)
-        if enable_sift and next_mode == "avt":
-            next_mode = "ventura"
+    next_sampling = base.sampling
+    if mode and next_mode in DETECTOR_SAMPLING_MODES and not next_sampling.enabled:
+        next_sampling = replace(next_sampling, enabled=True)
+    if enable_sampling is not None:
+        next_sampling = replace(next_sampling, enabled=enable_sampling)
+        if enable_sampling and next_mode == "avt":
+            next_mode = "anchor_footprint"
     next_detector = _validate_detector(detector) if detector else base.detector
     return replace(
         base,
         mode=next_mode,
         detector=next_detector,
-        sift=next_sift,
+        sampling=next_sampling,
         orb=orb if orb is not None else base.orb,
         superpoint=superpoint if superpoint is not None else base.superpoint,
         xfeat=xfeat if xfeat is not None else base.xfeat,
@@ -361,7 +369,7 @@ def build_avt_queries(
     return queries
 
 
-def build_sift_queries(
+def build_footprint_queries(
     frames_rgb: np.ndarray,
     query_config: QueryConfig,
     *,
@@ -369,58 +377,58 @@ def build_sift_queries(
 ) -> list[QueryPoint]:
     if frames_rgb.ndim != 4 or frames_rgb.shape[-1] != 3:
         raise ValueError("frames_rgb must have shape [T,H,W,3]")
-    if query_config.sift.max_query_points <= 0:
-        raise ValueError("sift max_query_points must be positive")
-    if query_config.sift.window_size <= 0:
-        raise ValueError("sift window_size must be positive")
+    if query_config.sampling.max_query_points <= 0:
+        raise ValueError("sampling max_query_points must be positive")
+    if query_config.sampling.window_size <= 0:
+        raise ValueError("sampling window_size must be positive")
 
     frame_count, height, width = frames_rgb.shape[:3]
-    mask = robot_sift_mask(height, width, query_config.robot, query_config.sift)
-    times = _sift_times(frame_count, query_config.sift.window_size)
+    mask = robot_footprint_mask(height, width, query_config.footprint, query_config.sampling)
+    times = _sampling_times(frame_count, query_config.sampling.window_size)
     return _sample_detector_queries(
         frames_rgb=frames_rgb,
         query_config=query_config,
         times=times,
-        max_query_points=query_config.sift.max_query_points,
+        max_query_points=query_config.sampling.max_query_points,
         mask=mask,
-        params=query_config.sift,
-        source="sift_robot",
+        params=query_config.sampling,
+        source="footprint",
         start_id=start_id,
         balance_full_mask=False,
     )
 
 
-def build_ventura_queries(
+def build_anchor_footprint_queries(
     frames_rgb: np.ndarray,
     query_config: QueryConfig,
     *,
     start_id: int = 0,
 ) -> list[QueryPoint]:
-    """Build VENTURA-equivalent anchor + robot-footprint SIFT queries."""
+    """Build full-frame anchor + robot-footprint detector queries."""
 
     if frames_rgb.ndim != 4 or frames_rgb.shape[-1] != 3:
         raise ValueError("frames_rgb must have shape [T,H,W,3]")
-    if not query_config.sift.enabled:
+    if not query_config.sampling.enabled:
         return []
-    if query_config.sift.window_size <= 0:
-        raise ValueError("sift window_size must be positive")
+    if query_config.sampling.window_size <= 0:
+        raise ValueError("sampling window_size must be positive")
 
     frame_count, height, width = frames_rgb.shape[:3]
     queries: list[QueryPoint] = []
-    anchors = query_config.sift.anchors
+    anchors = query_config.sampling.anchors
     if anchors.enabled:
-        anchor_window = anchors.window_size or query_config.sift.window_size
+        anchor_window = anchors.window_size or query_config.sampling.window_size
         if anchor_window <= 0:
-            raise ValueError("sift anchor window_size must be positive")
+            raise ValueError("sampling anchor window_size must be positive")
         queries.extend(
             _sample_detector_queries(
                 frames_rgb=frames_rgb,
                 query_config=query_config,
-                times=_sift_times(frame_count, anchor_window),
+                times=_sampling_times(frame_count, anchor_window),
                 max_query_points=anchors.max_query_points,
                 mask=None,
                 params=anchors,
-                source="sift_anchor",
+                source="anchor",
                 start_id=start_id + len(queries),
                 balance_full_mask=True,
             )
@@ -429,11 +437,11 @@ def build_ventura_queries(
         _sample_detector_queries(
             frames_rgb=frames_rgb,
             query_config=query_config,
-            times=_sift_times(frame_count, query_config.sift.window_size),
-            max_query_points=query_config.sift.max_query_points,
-            mask=robot_sift_mask(height, width, query_config.robot, query_config.sift),
-            params=query_config.sift,
-            source="sift_robot",
+            times=_sampling_times(frame_count, query_config.sampling.window_size),
+            max_query_points=query_config.sampling.max_query_points,
+            mask=robot_footprint_mask(height, width, query_config.footprint, query_config.sampling),
+            params=query_config.sampling,
+            source="footprint",
             start_id=start_id + len(queries),
             balance_full_mask=False,
         )
@@ -448,7 +456,7 @@ def _sample_detector_queries(
     times: list[int],
     max_query_points: int,
     mask: np.ndarray | None,
-    params: SiftCaptureConfig | SiftAnchorConfig,
+    params: QuerySamplingConfig | AnchorSamplingConfig,
     source: str,
     start_id: int,
     balance_full_mask: bool,
@@ -465,7 +473,7 @@ def _sample_detector_queries(
         keypoints = detector.detect(frames_rgb, reverse_time, mask)
         if not keypoints:
             continue
-        picked = _pick_sift_keypoints(
+        picked = _pick_top_keypoints(
             keypoints,
             width=width,
             count=samples_per_time,
@@ -492,7 +500,7 @@ def _sample_detector_queries(
     return queries
 
 
-def _pick_sift_keypoints(
+def _pick_top_keypoints(
     keypoints: tuple[cv2.KeyPoint, ...] | list[cv2.KeyPoint],
     *,
     width: int,
@@ -514,22 +522,22 @@ def _pick_sift_keypoints(
     return picked
 
 
-def robot_sift_mask(
+def robot_footprint_mask(
     height: int,
     width: int,
-    robot: VirtualRobotConfig,
-    sift: SiftCaptureConfig,
+    robot: FootprintConfig,
+    sampling: QuerySamplingConfig,
 ) -> np.ndarray:
-    alignment = align_virtual_robot_to_image(height=height, width=width, robot=robot)
+    alignment = align_footprint_to_image(height=height, width=width, robot=robot)
     left, right = alignment.left, alignment.right
     top, bottom = alignment.top, alignment.bottom
 
     mask = np.zeros((height, width), dtype=np.uint8)
     mask[top:bottom, left:right] = 255
 
-    if sift.sample_at_edges:
+    if sampling.sample_at_edges:
         rect_width = max(1, right - left)
-        edge_width = int(rect_width * sift.edge_offset_ratio)
+        edge_width = int(rect_width * sampling.edge_offset_ratio)
         inner_left = min(right, left + edge_width)
         inner_right = max(left, right - edge_width)
         if inner_right > inner_left:
@@ -537,13 +545,13 @@ def robot_sift_mask(
     return mask
 
 
-def align_virtual_robot_to_image(
+def align_footprint_to_image(
     *,
     height: int,
     width: int,
-    robot: VirtualRobotConfig,
+    robot: FootprintConfig,
 ) -> RobotImageAlignment:
-    """Align VENTURA's normalized bottom robot footprint to an image."""
+    """Align a normalized bottom-center robot footprint to an image."""
 
     if width <= 0 or height <= 0:
         raise ValueError("frame width and height must be positive")
@@ -563,7 +571,7 @@ def align_virtual_robot_to_image(
     return RobotImageAlignment(
         frame_width=int(width),
         frame_height=int(height),
-        method="ventura_pct_bottom_center",
+        method="bottom_center_footprint",
         width_ratio=float(width_ratio),
         length_ratio=float(height_ratio),
         left=int(left),
@@ -582,7 +590,7 @@ def query_artifact_arrays(queries: list[QueryPoint]) -> dict[str, np.ndarray]:
     sides = []
     source_codes = []
     for query in queries:
-        source_code = QUERY_SOURCE_CODES.get(query.source, -1)
+        source_code = QUERY_SOURCE_CODES.get(canonical_query_source(query.source), -1)
         row = [
             query.id,
             query.reverse_time,
@@ -606,7 +614,10 @@ def query_artifact_arrays(queries: list[QueryPoint]) -> dict[str, np.ndarray]:
         "query_sides": np.array(sides, dtype=np.int8),
         "query_source_codes": np.array(source_codes, dtype=np.int16),
         "query_records_json": np.array(
-            json.dumps([query.to_json() for query in queries]),
+            json.dumps([
+                query.to_json() | {"source": canonical_query_source(query.source)}
+                for query in queries
+            ]),
             dtype=np.str_,
         ),
     }
@@ -618,33 +629,33 @@ def query_capture_metadata(
     width: int | None = None,
     height: int | None = None,
 ) -> dict[str, Any]:
-    width_ratio, height_ratio = config.robot.derived_footprint_ratios()
-    avt_seed_y, avt_seed_x_min, avt_seed_x_max = config.robot.avt_seed_ratios()
+    width_ratio, height_ratio = config.footprint.derived_footprint_ratios()
+    avt_seed_y, avt_seed_x_min, avt_seed_x_max = config.footprint.avt_seed_ratios()
     alignment = (
-        align_virtual_robot_to_image(height=height, width=width, robot=config.robot)
+        align_footprint_to_image(height=height, width=width, robot=config.footprint)
         if width is not None and height is not None
         else None
     )
     return {
-        "schema": "avt_ventura_query_capture_v1",
+        "schema": "avt_query_capture_v2",
         "numeric_columns": QUERY_NUMERIC_COLUMNS,
         "cotracker_columns": ["reverse_time", "x", "y"],
-        "source_codes": QUERY_SOURCE_CODES,
+        "source_codes": PRIMARY_QUERY_SOURCE_CODES,
         "mode": config.mode,
-        "ventura_footprint": asdict(config.robot)
+        "footprint": asdict(config.footprint)
         | {
-            "robot_width_pct": width_ratio,
-            "robot_height_pct": height_ratio,
+            "footprint_width_ratio": width_ratio,
+            "footprint_height_ratio": height_ratio,
             "derived_avt_seed_y_ratio": avt_seed_y,
             "derived_avt_seed_x_min_ratio": avt_seed_x_min,
             "derived_avt_seed_x_max_ratio": avt_seed_x_max,
         },
         "image_alignment": alignment.to_json() if alignment else None,
-        "sift": asdict(config.sift),
+        "sampling": asdict(config.sampling),
     }
 
 
-def _sift_times(frame_count: int, window_size: int) -> list[int]:
+def _sampling_times(frame_count: int, window_size: int) -> list[int]:
     if frame_count <= 1:
         return [0]
     num_windows = max(1, frame_count // window_size)
@@ -656,7 +667,7 @@ def _sift_times(frame_count: int, window_size: int) -> list[int]:
 def _samples_per_time(
     max_query_points: int,
     time_count: int,
-    params: SiftCaptureConfig | SiftAnchorConfig,
+    params: QuerySamplingConfig | AnchorSamplingConfig,
 ) -> int:
     if time_count <= 0:
         return 0
@@ -667,9 +678,15 @@ def _samples_per_time(
 
 
 def _validate_mode(mode: str) -> str:
-    if mode not in {"ventura", "avt", "sift", "avt+sift"}:
-        raise ValueError("query_mode must be one of: ventura, avt, sift, avt+sift")
+    if mode not in QUERY_MODES:
+        raise ValueError(
+            "query_mode must be one of: anchor_footprint, footprint, avt, avt+footprint"
+        )
     return mode
+
+
+def canonical_query_source(source: str) -> str:
+    return str(source)
 
 
 def _ratio_value(data: dict[str, Any], keys: tuple[str, ...], default: float) -> float:

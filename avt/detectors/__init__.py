@@ -13,7 +13,7 @@ from .base import KeypointDetector, filter_keypoints_by_mask, make_keypoint
 from .config import OrbDetectorConfig, SuperPointConfig, XFeatConfig
 
 if TYPE_CHECKING:
-    from ..querying import QueryConfig, SiftAnchorConfig, SiftCaptureConfig
+    from ..querying import AnchorSamplingConfig, QueryConfig, QuerySamplingConfig
 
 DETECTORS = ("sift", "orb", "superpoint", "xfeat")
 
@@ -31,23 +31,26 @@ __all__ = [
 
 def build_detector(
     config: "QueryConfig",
-    sift_params: "SiftCaptureConfig | SiftAnchorConfig | None" = None,
+    sampling_params: "QuerySamplingConfig | AnchorSamplingConfig | None" = None,
 ) -> KeypointDetector:
     """Construct the detector named by ``config.detector``.
 
-    ``sift_params`` carries the per-tier SIFT tuning (anchors vs crumbs) and is
-    ignored by the non-SIFT detectors.
+    ``sampling_params`` carries per-tier tuning for anchor vs footprint sampling.
+    Only the SIFT detector consumes those detector-specific thresholds.
     """
 
     name = getattr(config, "detector", "sift")
     if name == "sift":
         from .sift import SiftDetector
 
-        return SiftDetector(sift_params if sift_params is not None else config.sift, config.sift)
+        return SiftDetector(
+            sampling_params if sampling_params is not None else config.sampling,
+            config.sampling,
+        )
     if name == "orb":
         from .orb import OrbDetector
 
-        return OrbDetector(config.orb, config.sift)
+        return OrbDetector(config.orb, config.sampling)
     if name == "superpoint":
         from .superpoint import SuperPointSuperGlueDetector
 
