@@ -17,6 +17,7 @@ viewer_runs/
 data/
 downloads/
 checkpoints/
+model_cache_upload/
 *.log
 *.jsonl
 *.zip
