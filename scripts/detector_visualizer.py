@@ -755,6 +755,7 @@ class DetectorServer:
                 cfg.model,
                 pretrained=(cfg.checkpoint is None),
                 top_k=int(cfg.top_k),
+                skip_validation=True,
             )
         if cfg.checkpoint:
             state = torch.load(cfg.checkpoint, map_location="cpu")

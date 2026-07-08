@@ -170,11 +170,19 @@ class CoTrackerBackend:
         query_rows = [[q.reverse_time, q.x, q.y] for q in queries]
         query_tensor = torch.tensor(query_rows, dtype=torch.float32, device=device)
 
+        repo_path = Path(self.hub_repo).expanduser()
+        hub_repo = str(repo_path) if repo_path.exists() else self.hub_repo
+        hub_kwargs = {"trust_repo": True}
+        if repo_path.exists():
+            hub_kwargs["source"] = "local"
+        else:
+            hub_kwargs["skip_validation"] = True
+
         try:
             model = torch.hub.load(
-                self.hub_repo,
+                hub_repo,
                 self.hub_model,
-                trust_repo=True,
+                **hub_kwargs,
             ).to(device)
         except Exception as exc:  # pragma: no cover - depends on local cache/network
             raise RuntimeError(
@@ -228,6 +236,7 @@ class CoTrackerBackend:
                 parameters={
                     "hub_repo": self.hub_repo,
                     "hub_model": self.hub_model,
+                    "hub_source": hub_kwargs.get("source", "github"),
                     "device": device,
                     "batch_size": self.batch_size,
                     "visibility_threshold": self.visibility_threshold,

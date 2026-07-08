@@ -7,6 +7,8 @@ one instance. Only keypoint locations + scores are used; descriptors discarded.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 
 from .base import filter_keypoints_by_mask, make_keypoint
@@ -36,11 +38,20 @@ def _load_xfeat(config: XFeatConfig):
     if key in _MODEL_CACHE:
         return _MODEL_CACHE[key]
 
+    repo_path = Path(config.hub_repo).expanduser()
+    hub_repo = str(repo_path) if repo_path.exists() else config.hub_repo
+    hub_kwargs = {}
+    if repo_path.exists():
+        hub_kwargs["source"] = "local"
+    else:
+        hub_kwargs["skip_validation"] = True
+
     model = torch.hub.load(
-        config.hub_repo,
+        hub_repo,
         config.model,
         pretrained=(config.checkpoint is None),
         top_k=int(config.top_k),
+        **hub_kwargs,
     )
     if config.checkpoint:
         state = torch.load(config.checkpoint, map_location="cpu")
