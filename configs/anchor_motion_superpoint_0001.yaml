@@ -1,0 +1,30 @@
+query_mode: anchor_motion
+detector: superpoint
+
+footprint:
+  # Legacy metadata only. Footprint query points are disabled in this repo.
+  width_ratio: 0.25
+  height_ratio: 0.20
+
+sampling:
+  enabled: true
+  max_query_points: 768
+  window_size: 20
+  min_points_per_frame: 8
+  max_points_per_frame: 20
+  sample_at_edges: true
+  edge_offset_ratio: 0.10
+  use_clahe: true
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: 8
+
+  anchors:
+    enabled: true
+    max_query_points: 512
+    window_size: null
+    min_points_per_frame: 32
+    max_points_per_frame: 128
+
+superpoint:
+  keypoint_threshold: 0.0001
+  max_keypoints: 2048

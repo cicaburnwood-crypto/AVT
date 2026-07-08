@@ -19,7 +19,7 @@ from avt.detectors import build_detector
 from avt.detectors.config import OrbDetectorConfig, SuperPointConfig, XFeatConfig
 from avt.detectors.orb import OrbDetector
 from avt.detectors.sift import SiftDetector
-from avt.detectors.superpoint import SuperPointSuperGlueDetector
+from avt.detectors.superpoint import SuperPointSuperGlueDetector, _threshold_and_rank
 from avt.detectors.xfeat import XFeatDetector
 from avt.inverse import build_queries, run_inverse_tracking
 from avt.io import read_frame_records
@@ -141,6 +141,19 @@ def test_build_detector_dispatch() -> None:
         cfg = replace(base, detector=name)
         assert isinstance(build_detector(cfg, base.sampling), cls)
     _assert_raises(ValueError, "detector must be one of", lambda: replace(base, detector="nope"))
+
+
+def test_superpoint_threshold_and_topk_filter() -> None:
+    kpts = np.array([[0, 0], [1, 1], [2, 2], [3, 3]], dtype=np.float32)
+    scores = np.array([0.00005, 0.2, 0.1, 0.3], dtype=np.float32)
+    kept_kpts, kept_scores = _threshold_and_rank(
+        kpts,
+        scores,
+        threshold=0.0001,
+        max_keypoints=2,
+    )
+    assert np.allclose(kept_scores, [0.3, 0.2])
+    assert kept_kpts.tolist() == [[3.0, 3.0], [1.0, 1.0]]
 
 
 def test_learned_detectors_install_hint_without_torch() -> None:

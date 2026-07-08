@@ -24,6 +24,25 @@ from .config import SuperPointConfig
 _MODEL_CACHE: dict = {}
 
 
+def _threshold_and_rank(
+    kpts: np.ndarray,
+    scores: np.ndarray,
+    *,
+    threshold: float,
+    max_keypoints: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if len(kpts) == 0:
+        return kpts, scores
+    keep = scores >= float(threshold)
+    kpts = kpts[keep]
+    scores = scores[keep]
+    if max_keypoints >= 0 and len(scores) > int(max_keypoints):
+        order = np.argsort(scores)[::-1][: int(max_keypoints)]
+        kpts = kpts[order]
+        scores = scores[order]
+    return kpts, scores
+
+
 def _resolve_device(device: str | None) -> str:
     import torch
 
@@ -104,6 +123,12 @@ class SuperPointSuperGlueDetector:
         result = results[0]
         kpts = result["keypoints"].detach().cpu().numpy()
         scores = result["scores"].detach().cpu().numpy()
+        kpts, scores = _threshold_and_rank(
+            kpts,
+            scores,
+            threshold=float(self._config.keypoint_threshold),
+            max_keypoints=int(self._config.max_keypoints),
+        )
         keypoints = [
             make_keypoint(float(x), float(y), float(s))
             for (x, y), s in zip(kpts, scores)
@@ -146,6 +171,12 @@ class SuperPointSuperGlueDetector:
         result = results[0]
         kpts0 = result["keypoints0"].detach().cpu().numpy()
         scores = result["matching_scores"].detach().cpu().numpy()
+        kpts0, scores = _threshold_and_rank(
+            kpts0,
+            scores,
+            threshold=0.0,
+            max_keypoints=int(self._config.max_keypoints),
+        )
         keypoints = [
             make_keypoint(float(x), float(y), float(s))
             for (x, y), s in zip(kpts0, scores)

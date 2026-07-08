@@ -34,6 +34,9 @@ HF_HOME_DIR="${HF_HOME_DIR:-$AVT_ROOT/model_cache/huggingface}"
 HF_HUB_CACHE_DIR="${HF_HUB_CACHE_DIR:-$HF_HOME_DIR/hub}"
 COTRACKER_REPO="${COTRACKER_REPO:-$TORCH_HOME_DIR/hub/facebookresearch_co-tracker_main}"
 COTRACKER_MODEL="${COTRACKER_MODEL:-cotracker3_offline}"
+QUERY_CONFIG="${QUERY_CONFIG:-$AVT_ROOT/configs/anchor_motion.yaml}"
+GPU_INCLUDE="${GPU_INCLUDE:-}"
+GPU_EXCLUDE="${GPU_EXCLUDE:-}"
 
 DEFAULT_RIDES=(
   "ride_17620_20240130041859"
@@ -57,6 +60,8 @@ Useful overrides:
   BUILD_VIEWER=0                        skip static WebUI build
   EST_SECONDS_PER_WINDOW=12             rough launch ETA model
   GPU_MEM_LIMIT_PCT=20 GPU_UTIL_LIMIT_PCT=20
+  GPU_EXCLUDE=0,1,2                     avoid already-used GPUs
+  QUERY_CONFIG=/path/to/query.yaml      override query config
   AVT_ROOT=/data/disk_14t/diwen/AVT_P
 USAGE
 }
@@ -156,6 +161,29 @@ free_gpu_lines_from_samples() {
         }
       }
     }' "$samples" | sort -n
+}
+
+gpu_list_contains() {
+  local list="$1"
+  local item="$2"
+  [[ -z "$list" ]] && return 1
+  local IFS=','
+  local value
+  for value in $list; do
+    [[ "$value" == "$item" ]] && return 0
+  done
+  return 1
+}
+
+gpu_allowed_by_lists() {
+  local gpu="$1"
+  if [[ -n "$GPU_INCLUDE" ]] && ! gpu_list_contains "$GPU_INCLUDE" "$gpu"; then
+    return 1
+  fi
+  if [[ -n "$GPU_EXCLUDE" ]] && gpu_list_contains "$GPU_EXCLUDE" "$gpu"; then
+    return 1
+  fi
+  return 0
 }
 
 write_job_script() {
@@ -273,7 +301,7 @@ AVT_ARGS=(
   --cotracker-hub-repo "$COTRACKER_REPO"
   --cotracker-hub-model "$COTRACKER_MODEL"
   --query-mode anchor_motion
-  --query-config "$AVT_ROOT/configs/anchor_motion.yaml"
+  --query-config "$QUERY_CONFIG"
   --detector "$DETECTOR"
   --window-size "$WINDOW_SIZE"
   --window-step "$WINDOW_STEP"
@@ -392,9 +420,23 @@ launch() {
   collect_gpu_samples "$samples"
 
   mapfile -t free_lines < <(free_gpu_lines_from_samples "$samples")
+  if [[ -n "$GPU_INCLUDE" || -n "$GPU_EXCLUDE" ]]; then
+    local filtered_lines=()
+    local line
+    for line in "${free_lines[@]}"; do
+      local gpu_idx
+      gpu_idx="$(awk '{print $1}' <<<"$line")"
+      if gpu_allowed_by_lists "$gpu_idx"; then
+        filtered_lines+=("$line")
+      fi
+    done
+    free_lines=("${filtered_lines[@]}")
+  fi
   if (( ${#free_lines[@]} < GPU_COUNT )); then
     echo "GPU samples:"
     cat "$samples"
+    [[ -n "$GPU_INCLUDE" ]] && echo "GPU_INCLUDE=$GPU_INCLUDE"
+    [[ -n "$GPU_EXCLUDE" ]] && echo "GPU_EXCLUDE=$GPU_EXCLUDE"
     die "Need $GPU_COUNT free GPUs, found ${#free_lines[@]}"
   fi
 
@@ -451,6 +493,7 @@ launch() {
       HF_HUB_CACHE_DIR="$HF_HUB_CACHE_DIR" \
       COTRACKER_REPO="$COTRACKER_REPO" \
       COTRACKER_MODEL="$COTRACKER_MODEL" \
+      QUERY_CONFIG="$QUERY_CONFIG" \
       MAX_WINDOWS="$MAX_WINDOWS" \
       BUILD_VIEWER="$BUILD_VIEWER" \
       SAVE_PATH_MASK="$SAVE_PATH_MASK" \
