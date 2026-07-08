@@ -4,7 +4,7 @@ Turns a PreparedWindow into the list of query points that the tracker will
 follow. The ``PointExtractor`` Protocol mirrors ``PointTracker`` so alternative
 detectors (e.g. ORB / XFeat) can be dropped in the same way tracking backends
 are, without touching the orchestrator. ``QueryPointExtractor`` is the default
-and preserves today's anchor/footprint/AVT behavior.
+anchor-motion extractor for this repo.
 """
 
 from __future__ import annotations
@@ -16,12 +16,11 @@ import numpy as np
 from ..config import InverseTrackConfig
 from ..querying import (
     DETECTOR_SAMPLING_MODES,
-    build_anchor_footprint_queries,
-    build_avt_queries,
+    build_anchor_motion_queries,
     build_footprint_queries,
 )
 from ..schema import QueryPoint
-from .preprocess import PreparedWindow, _avt_seed_ratios
+from .preprocess import PreparedWindow
 
 
 def build_queries(
@@ -33,15 +32,14 @@ def build_queries(
 ) -> list[QueryPoint]:
     queries: list[QueryPoint] = []
     mode = config.query_config.mode
-    seed_y_ratio, seed_x_min_ratio, seed_x_max_ratio = _avt_seed_ratios(config, width, height)
-    want_anchor_footprint = mode in {"anchor_footprint", "avt+footprint"}
+    want_anchor_motion = mode in {"anchor_motion", "anchor_footprint", "avt+footprint"}
     want_footprint = mode == "footprint"
 
-    if want_anchor_footprint:
+    if want_anchor_motion:
         if frames_rgb is None:
-            raise ValueError("frames_rgb is required for anchor/footprint query capture")
+            raise ValueError("frames_rgb is required for anchor-motion query capture")
         queries.extend(
-            build_anchor_footprint_queries(
+            build_anchor_motion_queries(
                 frames_rgb=frames_rgb,
                 query_config=config.query_config,
                 start_id=len(queries),
@@ -49,7 +47,7 @@ def build_queries(
         )
     elif want_footprint:
         if frames_rgb is None:
-            raise ValueError("frames_rgb is required for footprint query capture")
+            raise ValueError("footprint query points are disabled in the anchor-motion repo")
         queries.extend(
             build_footprint_queries(
                 frames_rgb=frames_rgb,
@@ -59,19 +57,7 @@ def build_queries(
         )
 
     if mode == "avt":
-        queries.extend(
-            build_avt_queries(
-                width=width,
-                height=height,
-                frame_count=frame_count,
-                query_stride=config.query_stride,
-                seed_count=config.seed_count,
-                seed_y_ratio=seed_y_ratio,
-                seed_x_min_ratio=seed_x_min_ratio,
-                seed_x_max_ratio=seed_x_max_ratio,
-                start_id=len(queries),
-            )
-        )
+        raise ValueError("manual AVT seed-line query points are disabled in the anchor-motion repo")
 
     if not queries and mode in DETECTOR_SAMPLING_MODES:
         raise ValueError("No detector-sampled query points were generated")

@@ -16,7 +16,7 @@ from avt.inverse import build_queries, run_inverse_tracking
 from avt.io import read_frame_records
 from avt.pipeline import PreparedWindow, QueryPointExtractor
 from avt.pipeline.preprocess import build_windows, prepare_window
-from avt.querying import QueryConfig, QuerySamplingConfig
+from avt.querying import AnchorSamplingConfig, QueryConfig, QuerySamplingConfig
 from avt.schema import QueryPoint, TrackerInfo, WindowSpec
 from avt.tracking.base import TrackingBundle
 
@@ -48,8 +48,9 @@ class FakeExtractor:
 
 def write_frames(root: Path, count: int = 6) -> None:
     root.mkdir()
+    rng = np.random.default_rng(11)
     for idx in range(count):
-        img = np.zeros((48, 64, 3), dtype=np.uint8)
+        img = rng.integers(0, 255, (48, 64, 3), dtype=np.uint8)
         cv2.circle(img, (12 + idx, 24), 4, (255, 255, 255), -1)
         cv2.imwrite(str(root / f"{idx:04d}.png"), img)
 
@@ -61,7 +62,19 @@ def _avt_config() -> InverseTrackConfig:
         query_stride=2,
         seed_count=3,
         max_windows=1,
-        query_config=QueryConfig(mode="avt", sampling=QuerySamplingConfig(enabled=False)),
+        query_config=QueryConfig(
+            mode="anchor_motion",
+            sampling=QuerySamplingConfig(
+                enabled=True,
+                anchors=AnchorSamplingConfig(
+                    enabled=True,
+                    max_query_points=8,
+                    min_points_per_frame=4,
+                    max_points_per_frame=8,
+                    contrast_threshold=0.001,
+                ),
+            ),
+        ),
     )
 
 

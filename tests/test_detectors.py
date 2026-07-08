@@ -23,7 +23,7 @@ from avt.detectors.superpoint import SuperPointSuperGlueDetector
 from avt.detectors.xfeat import XFeatDetector
 from avt.inverse import build_queries, run_inverse_tracking
 from avt.io import read_frame_records
-from avt.querying import FootprintConfig, QueryConfig, QuerySamplingConfig, robot_footprint_mask
+from avt.querying import AnchorSamplingConfig, QueryConfig, QuerySamplingConfig
 from avt.schema import QueryPoint, TrackerInfo
 from avt.tracking.base import TrackingBundle
 
@@ -103,25 +103,30 @@ def test_orb_detector_respects_mask() -> None:
     assert all(kp.pt[1] >= h // 2 for kp in kps)
 
 
-def test_orb_build_queries_within_footprint() -> None:
+def test_orb_build_queries_anchor_motion_full_frame() -> None:
     frames = _textured_frames(6)
     h, w = frames.shape[1:3]
-    # Roomy footprint without edge-carving so ORB's 31px patch fits inside the mask.
     config = InverseTrackConfig(
         query_config=QueryConfig(
-            mode="footprint",
+            mode="anchor_motion",
             detector="orb",
-            footprint=FootprintConfig(width_ratio=0.6, height_ratio=0.5),
-            sampling=QuerySamplingConfig(sample_at_edges=False),
+            sampling=QuerySamplingConfig(
+                sample_at_edges=False,
+                anchors=AnchorSamplingConfig(
+                    enabled=True,
+                    max_query_points=24,
+                    min_points_per_frame=8,
+                    max_points_per_frame=24,
+                ),
+            ),
         )
     )
     queries = build_queries(w, h, len(frames), config, frames_rgb=frames)
     assert queries
-    assert all(q.source == "footprint" for q in queries)
-    mask = robot_footprint_mask(h, w, config.query_config.footprint, config.query_config.sampling)
-    for q in queries:
-        assert mask[int(round(q.y)), int(round(q.x))] > 0
-        assert q.response is not None  # ORB Harris score recorded
+    assert all(q.source == "anchor" for q in queries)
+    assert {q.reverse_time for q in queries} == {0}
+    assert all(0 <= q.x < w and 0 <= q.y < h for q in queries)
+    assert all(q.response is not None for q in queries)  # ORB Harris score recorded
 
 
 def test_build_detector_dispatch() -> None:
@@ -156,11 +161,14 @@ def test_orb_end_to_end_run(tmp_path: Path) -> None:
         window_size=6,
         window_step=6,
         max_windows=1,
-        query_config=QueryConfig(mode="anchor_footprint", detector="orb"),
+        query_config=QueryConfig(mode="anchor_motion", detector="orb"),
     )
     windows = run_inverse_tracking(frames_root, records, tmp_path / "out", FakeTracker(), config)
     window_dir = tmp_path / "out" / "windows" / windows[0].id
     arrays = np.load(window_dir / "tracks.npz")
     assert arrays["tracks_reverse"].shape[1] > 0  # ORB produced query points
+    assert set(arrays["query_source_codes"].tolist()) == {2}
+    assert "anchor_motion_projected_mother_reverse" in arrays
     meta = json.loads((window_dir / "window.json").read_text())
     assert meta["config"]["query_config"]["detector"] == "orb"
+    assert meta["anchor_motion"]["method"] == "anchor_affine_motion_projected_mother_point"

@@ -9,7 +9,7 @@ sampling:
   enabled: true
   # Legacy footprint sampling fields are ignored by anchor_motion mode.
   max_query_points: 768
-  window_size: 1
+  window_size: 20
   min_points_per_frame: 8
   max_points_per_frame: 20
   sample_at_edges: true
@@ -22,7 +22,6 @@ sampling:
   edge_threshold: 20.0
   sigma: 1.5
 
-  # Anchor-motion samples anchors only at reverse_time 0, regardless of window_size.
   anchors:
     enabled: true
     max_query_points: 512

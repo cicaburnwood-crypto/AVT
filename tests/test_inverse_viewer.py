@@ -6,12 +6,14 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from avt.anchor_motion import estimate_anchor_motion_projection
 from avt.cli import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_VIEWER_ROOT,
     _create_unique_run_dir,
     build_parser,
 )
+from avt.config import AnchorMotionConfig
 from avt.inverse import InverseTrackConfig, build_queries, reference_mask, run_inverse_tracking
 from avt.io import read_frame_records
 from avt.querying import (
@@ -59,26 +61,83 @@ class FakeTracker:
         )
 
 
+def test_anchor_motion_projects_mother_point_from_affine_tracks() -> None:
+    base = np.array(
+        [
+            [10.0, 10.0],
+            [30.0, 10.0],
+            [10.0, 30.0],
+            [30.0, 30.0],
+            [20.0, 18.0],
+            [35.0, 25.0],
+        ],
+        dtype=np.float32,
+    )
+    frame_count = 4
+    tracks = np.zeros((frame_count, len(base), 2), dtype=np.float32)
+    for t in range(frame_count):
+        tracks[t] = base + np.array([2.0 * t, 3.0 * t], dtype=np.float32)
+    bundle = TrackingBundle(
+        tracks=tracks,
+        visibility=np.ones((frame_count, len(base)), dtype=bool),
+        tracker=TrackerInfo(name="fake"),
+    )
+    queries = [
+        QueryPoint(id=i, reverse_time=0, x=float(x), y=float(y), side=-1, source="anchor")
+        for i, (x, y) in enumerate(base)
+    ]
+
+    projection = estimate_anchor_motion_projection(
+        bundle,
+        queries,
+        width=100,
+        height=80,
+        config=AnchorMotionConfig(min_matches=4),
+    )
+
+    mother = np.array([49.5, 79.0], dtype=np.float32)
+    expected = np.stack(
+        [mother + np.array([2.0 * t, 3.0 * t], dtype=np.float32) for t in range(frame_count)]
+    )
+    assert projection.valid_reverse.tolist() == [True, True, True, True]
+    assert np.allclose(projection.projected_points_reverse, expected, atol=1e-3)
+
+
 def write_frames(root: Path, count: int = 6) -> None:
     root.mkdir()
+    rng = np.random.default_rng(17)
     for idx in range(count):
-        img = np.zeros((48, 64, 3), dtype=np.uint8)
+        img = rng.integers(0, 255, (48, 64, 3), dtype=np.uint8)
         cv2.circle(img, (12 + idx, 24), 4, (255, 255, 255), -1)
         cv2.imwrite(str(root / f"{idx:04d}.png"), img)
 
 
 def test_build_queries() -> None:
+    rng = np.random.default_rng(3)
+    frames = rng.integers(0, 255, size=(5, 80, 100, 3), dtype=np.uint8)
     config = InverseTrackConfig(
-        query_stride=2,
-        seed_count=3,
-        query_config=QueryConfig(mode="avt", sampling=QuerySamplingConfig(enabled=False)),
+        query_config=QueryConfig(
+            mode="anchor_motion",
+            sampling=QuerySamplingConfig(
+                enabled=True,
+                anchors=AnchorSamplingConfig(
+                    enabled=True,
+                    max_query_points=12,
+                    min_points_per_frame=4,
+                    max_points_per_frame=12,
+                    contrast_threshold=0.001,
+                ),
+            ),
+        ),
     )
-    queries = build_queries(width=100, height=80, frame_count=5, config=config)
-    assert [q.reverse_time for q in queries] == [0, 0, 0, 2, 2, 2, 4, 4, 4]
-    assert [q.id for q in queries] == list(range(9))
+    queries = build_queries(width=100, height=80, frame_count=5, config=config, frames_rgb=frames)
+    assert queries
+    assert {q.source for q in queries} == {"anchor"}
+    assert {q.reverse_time for q in queries} == {0}
+    assert [q.id for q in queries] == list(range(len(queries)))
 
 
-def test_build_anchor_footprint_queries() -> None:
+def test_build_anchor_footprint_queries_are_anchor_only_alias() -> None:
     rng = np.random.default_rng(7)
     frames = rng.integers(0, 255, size=(8, 96, 128, 3), dtype=np.uint8)
 
@@ -95,6 +154,8 @@ def test_build_anchor_footprint_queries() -> None:
                 anchors=AnchorSamplingConfig(
                     enabled=True,
                     max_query_points=16,
+                    min_points_per_frame=4,
+                    max_points_per_frame=16,
                     window_size=4,
                     contrast_threshold=0.001,
                 ),
@@ -105,15 +166,14 @@ def test_build_anchor_footprint_queries() -> None:
     queries = build_queries(128, 96, len(frames), config, frames_rgb=frames)
     arrays = query_artifact_arrays(queries)
 
-    assert {query.source for query in queries} == {"anchor", "footprint"}
+    assert {query.source for query in queries} == {"anchor"}
     assert "avt" not in {query.source for query in queries}
+    assert "footprint" not in {query.source for query in queries}
+    assert {query.reverse_time for query in queries} == {0}
     assert [query.id for query in queries] == list(range(len(queries)))
-    first_footprint = next(idx for idx, query in enumerate(queries) if query.source == "footprint")
-    assert all(query.source == "anchor" for query in queries[:first_footprint])
-    assert all(query.source == "footprint" for query in queries[first_footprint:])
     assert arrays["queries"].shape[1] == 11
     assert arrays["queries_cotracker"].shape == (len(queries), 3)
-    assert set(arrays["query_source_codes"].tolist()) == {1, 2}
+    assert set(arrays["query_source_codes"].tolist()) == {2}
 
 
 def test_bottom_center_footprint_mask_edges() -> None:
@@ -177,6 +237,8 @@ def test_query_config_from_yaml_mapping() -> None:
     assert config.sampling.min_points_per_frame == 8
     assert config.sampling.max_points_per_frame == 20
     assert config.sampling.anchors.max_query_points == 192
+    assert config.sampling.anchors.min_points_per_frame == 32
+    assert config.sampling.anchors.max_points_per_frame == 128
 
 
 def test_create_unique_run_dir(tmp_path: Path) -> None:
@@ -392,7 +454,19 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
         seed_count=3,
         max_windows=1,
         save_reverse_video=False,
-        query_config=QueryConfig(mode="avt", sampling=QuerySamplingConfig(enabled=False)),
+        query_config=QueryConfig(
+            mode="anchor_motion",
+            sampling=QuerySamplingConfig(
+                enabled=True,
+                anchors=AnchorSamplingConfig(
+                    enabled=True,
+                    max_query_points=8,
+                    min_points_per_frame=4,
+                    max_points_per_frame=8,
+                    contrast_threshold=0.001,
+                ),
+            ),
+        ),
     )
     windows = run_inverse_tracking(frames_root, records, output_root, FakeTracker(), config)
     assert len(windows) == 1
@@ -403,6 +477,8 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
     arrays = np.load(output_root / "windows" / "seq_0_4" / "tracks.npz")
     assert arrays["confidence_reverse"].shape == arrays["visibility_reverse"].shape
     assert arrays["confidence_reverse"].dtype == np.float32
+    assert set(arrays["query_source_codes"].tolist()) == {2}
+    assert "anchor_motion_projected_mother_reverse" in arrays
 
     viewer_dir = tmp_path / "viewer"
     payload = build_viewer(frames_root, records, output_root, viewer_dir)

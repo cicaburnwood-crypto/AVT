@@ -1,13 +1,13 @@
-query_mode: anchor_footprint
+query_mode: anchor_motion
 
 footprint:
-  # Normalized image-space scale, not physical robot calibration.
+  # Legacy metadata only. Footprint query points are disabled in this repo.
   width_ratio: 0.25
   height_ratio: 0.20
 
 sampling:
   enabled: true
-  # Robot-footprint points: sample one detector frame per this many frames.
+  # Legacy footprint sampling fields are ignored by anchor_motion mode.
   max_query_points: 768
   window_size: 20
   min_points_per_frame: 8
@@ -22,13 +22,14 @@ sampling:
   edge_threshold: 20.0
   sigma: 1.5
 
-  # Full-frame anchors are tracked with footprint points, then excluded from path masks.
+  # Full-frame anchors are sampled only in reverse_time 0, tracked backward
+  # through the inverse sequence, then used to estimate frame-level motion.
   anchors:
     enabled: true
     max_query_points: 512
-    window_size: 20
-    min_points_per_frame: 8
-    max_points_per_frame: 20
+    window_size: null
+    min_points_per_frame: 32
+    max_points_per_frame: 128
     n_octave_layers: 3
     contrast_threshold: 0.008
     edge_threshold: 15.0

@@ -1,10 +1,20 @@
-# AVT
+# AVT Anchor Motion
 
 Any - Video - Trainning - Databuild and process toolkit
 
-AVT is a standalone inverse-video point tracking and WebUI visualization toolkit.
-It was extracted so the tracking model, inverse tracking pipeline, and viewer are
-separate pieces:
+This repo is an anchor-motion experimental variant of AVT. It disables
+footprint query points and instead:
+
+1. samples full-frame anchor points only in each window's last frame;
+2. inverse-tracks those anchors through the reversed window;
+3. estimates adjacent frame-level affine motion from anchor tracks;
+4. chooses the bottom-center point in the window's last frame as the mother
+   point;
+5. projects that mother point into every reverse frame with the accumulated
+   frame-level motion.
+
+The tracking model, inverse tracking pipeline, and viewer remain separate
+pieces:
 
 - `avt/tracking/`: point tracker backends.
 - `avt/inverse.py`: reversed-video windowing, query seeding, and artifact export.
@@ -36,8 +46,8 @@ avt all \
   --source-type auto \
   --backend cotracker \
   --cotracker-device cuda \
-  --query-mode anchor_footprint \
-  --query-config configs/anchor_footprint.yaml \
+  --query-mode anchor_motion \
+  --query-config configs/anchor_motion.yaml \
   --window-size 250 \
   --window-step 100 \
   --fps 10
@@ -76,8 +86,8 @@ avt all \
   --source-type auto \
   --backend bootstap \
   --bootstap-config configs/bootstap.yaml \
-  --query-mode anchor_footprint \
-  --query-config configs/anchor_footprint.yaml
+  --query-mode anchor_motion \
+  --query-config configs/anchor_motion.yaml
 ```
 
 The backend keeps AVT's query generation and artifact format unchanged. It
@@ -102,19 +112,20 @@ The checkpoint URL follows the official TAPNet PyTorch BootsTAPIR notebook:
 The TAPNet README notes that BootsTAPIR typically performs best at `512x512`,
 which is why the AVT config uses that resize by default.
 
-`--query-mode anchor_footprint` is the default. It reverses each video window,
-samples full-frame anchors for tracking stability, samples footprint points from
-a bottom-center percentage mask, then builds the path mask from footprint points
-while excluding anchors. `--query-mode footprint` keeps only the footprint
-points, and `--query-mode avt` remains as a manual deterministic seed-line
-fallback.
+`--query-mode anchor_motion` is the default. It reverses each video window,
+samples full-frame anchors only at `reverse_time=0`, tracks those anchors
+through the inverse sequence, estimates frame-level affine motion, then projects
+the window-last-frame bottom-center mother point into every reverse frame.
+Legacy `anchor_footprint` and `avt+footprint` modes are treated as anchor-only
+aliases in this repo. `footprint` and manual `avt` query points are disabled in
+the default extractor.
 
 ### Point-Extraction Detectors
 
 The keypoint detector used to propose query points (Stage 2) is selectable with
 `--detector`, independently of `--query-mode` and `--backend`. All methods reuse
-the same anchor/footprint masking and top-N selection; only the keypoint source
-differs. Descriptors are discarded — only locations are tracked.
+the same full-frame anchor top-N selection; only the keypoint source differs.
+Descriptors are discarded — only locations are tracked.
 
 | `--detector` | Engine | Extra deps | Notes |
 |--------------|--------|-----------|-------|
@@ -143,16 +154,15 @@ with `--superpoint-device`, `--xfeat-checkpoint`, etc.):
 - SuperGlue (optional prefilter): [`magic-leap-community/superglue_outdoor`](https://huggingface.co/magic-leap-community/superglue_outdoor) — research/non-commercial license
 - XFeat: [`verlab/accelerated_features`](https://github.com/verlab/accelerated_features) via `torch.hub` (weights `xfeat.pt`)
 
-The footprint alignment is calibration-free. It reads the decoded frame width
-and height for each window, applies normalized width/height percentages to a
-bottom-center rectangle, and records the resolved pixel bounds in
-`window.json`. It does not ask for camera intrinsics, focal length, pitch, or
-accurate camera height, which keeps it usable for arbitrary internet videos.
+The mother point is calibration-free. It uses the decoded frame size and the
+default normalized coordinate `(x=0.5, y=1.0)`, which resolves to bottom-center
+in the window's last frame. It does not ask for camera intrinsics, focal length,
+pitch, or accurate camera height.
 
-`configs/anchor_footprint.yaml` contains the default anchor/footprint parameters:
+`configs/anchor_motion.yaml` contains the default anchor-motion parameters:
 
 ```yaml
-query_mode: anchor_footprint
+query_mode: anchor_motion
 footprint:
   width_ratio: 0.25
   height_ratio: 0.20
@@ -166,24 +176,18 @@ sampling:
   use_clahe: true
   anchors:
     enabled: true
-    max_query_points: 384
-    min_points_per_frame: 8
-    max_points_per_frame: 20
+    max_query_points: 512
+    min_points_per_frame: 32
+    max_points_per_frame: 128
 ```
 
-`sampling.window_size` is the detector sampling interval, separate from the
-tracking `--window-size`. When `--detector sift` is selected, footprint SIFT uses
-`contrastThreshold=0.018`, `edgeThreshold=20`, `nOctaveLayers=5`, `sigma=1.5`;
-anchor SIFT uses `contrastThreshold=0.008`, `edgeThreshold=15`,
-`nOctaveLayers=3`, `sigma=1.2`. CLAHE preprocessing is enabled by default. AVT
-clamps each selected sampling frame to 8-20 query points so long tracking
-windows do not become under-seeded.
+`sampling.window_size` is kept for config compatibility, but anchor-motion
+sampling inserts anchors only at reverse time 0. When `--detector sift` is
+selected, anchor SIFT uses `contrastThreshold=0.008`, `edgeThreshold=15`,
+`nOctaveLayers=3`, `sigma=1.2`. CLAHE preprocessing is enabled by default.
 
-When `--save-path-mask` is enabled, the displayed reference-frame path mask also
-uses support points: extra relaxed SIFT points are sampled on the bottom robot
-footprint of the reference frame and used only to draw the mask. Disable support
-points with `--no-path-support`, or tune them with
-`--path-support-min-points` and `--path-support-fraction`.
+When `--save-path-mask` is enabled, `path_mask_reference.png` is drawn from the
+projected mother-point trace. Legacy footprint support points are disabled.
 
 By default, each CLI run writes into a fresh child directory under
 `/home/wolfie/Project/Cyber_Guider/AVT/outputs`, for example
@@ -218,13 +222,13 @@ avt all \
   --frames-root /path/to/recording_or_images \
   --backend foundationpose \
   --foundationpose-transforms /path/to/foundationpose_transforms.npz \
-  --query-mode anchor_footprint \
-  --query-config configs/anchor_footprint.yaml
+  --query-mode anchor_motion \
+  --query-config configs/anchor_motion.yaml
 ```
 
-This keeps the original CoTracker/LK pipeline intact. AVT still extracts the
-same anchor and footprint query points; the FoundationPose backend converts
-pose-derived image transforms into AVT point tracks.
+This keeps the tracker backend replaceable. AVT extracts only anchor query
+points; the FoundationPose backend converts pose-derived image transforms into
+AVT point tracks.
 
 FoundationPose itself is not an RGB-only point tracker. A real FoundationPose
 run needs RGB-D frames, object masks, camera intrinsics, and CAD/reference object
@@ -293,13 +297,21 @@ Optional debug outputs are opt-in:
   the sparse CoTracker query shape.
 - `query_sides`: `int8[N]`.
 - `query_source_codes`: `int16[N]`, where `0` is fixed AVT seeds, `1` is
-  footprint points, and `2` is full-frame anchors.
+  legacy footprint points, and `2` is full-frame anchors. This repo's default
+  output should contain only source code `2`.
 - `query_records_json`: rich per-query metadata, including source and keypoint
   fields when available.
+- `anchor_motion_transforms_reverse`: `float32[T, 2, 3]`, accumulated affine
+  transforms from reverse frame 0 to each reverse frame.
+- `anchor_motion_projected_mother_reverse`: `float32[T, 2]`, the bottom-center
+  mother point projected into every reverse frame.
+- `anchor_motion_valid_reverse`: `bool[T]`, whether the accumulated projection
+  is valid for each reverse frame.
+- `anchor_motion_adjacent_*`: per-adjacent-frame inlier and reprojection-error
+  diagnostics.
 
-`window.json` also stores `query_capture.image_alignment`, including the input
-window resolution, pixel footprint bounds, normalized seed ratios, and the
-`bottom_center_footprint` alignment method.
+`window.json` also stores an `anchor_motion` block with the mother point,
+projection counts, and affine motion quality summary.
 
 Any future tracker can plug in by returning a `TrackingBundle` with the same
 `tracks` and `visibility` shapes.

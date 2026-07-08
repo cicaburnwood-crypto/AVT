@@ -14,13 +14,16 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from ..anchor_motion import (
+    estimate_anchor_motion_projection,
+    projection_mask,
+    projection_metadata,
+)
 from ..config import InverseTrackConfig
 from ..io import write_mp4
 from ..querying import (
-    DETECTOR_SAMPLING_MODES,
     query_artifact_arrays,
     query_capture_metadata,
-    robot_footprint_mask,
 )
 from ..schema import QueryPoint, WindowSpec
 from ..tracking.base import TrackingBundle
@@ -68,39 +71,9 @@ def reference_mask(
 
 
 def _reference_support_points(frame_rgb: np.ndarray, config: InverseTrackConfig) -> np.ndarray:
-    if not config.path_support_enabled:
-        return np.empty((0, 2), dtype=np.float32)
-    if config.query_config.mode not in DETECTOR_SAMPLING_MODES:
-        return np.empty((0, 2), dtype=np.float32)
-    if config.path_support_min_points <= 0:
-        return np.empty((0, 2), dtype=np.float32)
+    """Footprint support points are disabled in the anchor-motion repo."""
 
-    h, w = frame_rgb.shape[:2]
-    max_query_points = max(1, int(config.query_config.sampling.max_query_points))
-    fraction = max(1, int(config.path_support_fraction))
-    count = max(int(config.path_support_min_points), max_query_points // fraction)
-    mask = robot_footprint_mask(h, w, config.query_config.footprint, config.query_config.sampling)
-    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-    if config.query_config.sampling.use_clahe:
-        tile = max(1, int(config.query_config.sampling.clahe_tile_grid_size))
-        clahe = cv2.createCLAHE(
-            clipLimit=float(config.query_config.sampling.clahe_clip_limit),
-            tileGridSize=(tile, tile),
-        )
-        gray = clahe.apply(gray)
-
-    sift = cv2.SIFT_create(
-        nfeatures=0,
-        nOctaveLayers=4,
-        contrastThreshold=0.006,
-        edgeThreshold=24,
-        sigma=1.2,
-    )
-    keypoints, _ = sift.detectAndCompute(gray, mask)
-    if not keypoints:
-        return np.empty((0, 2), dtype=np.float32)
-    picked = sorted(keypoints, key=lambda kp: kp.response, reverse=True)[:count]
-    return np.array([kp.pt for kp in picked], dtype=np.float32)
+    return np.empty((0, 2), dtype=np.float32)
 
 
 def write_window_artifacts(
@@ -116,9 +89,25 @@ def write_window_artifacts(
     h, w = frames_rgb.shape[1:3]
 
     query_arrays = query_artifact_arrays(queries)
+    projection = estimate_anchor_motion_projection(
+        bundle,
+        queries,
+        width=w,
+        height=h,
+        config=config.anchor_motion,
+    )
     track_arrays = {
         "tracks_reverse": bundle.tracks.astype(np.float32),
         "visibility_reverse": bundle.visibility.astype(bool),
+        "anchor_motion_transforms_reverse": projection.transforms_reverse.astype(np.float32),
+        "anchor_motion_projected_mother_reverse": projection.projected_points_reverse.astype(np.float32),
+        "anchor_motion_valid_reverse": projection.valid_reverse.astype(bool),
+        "anchor_motion_adjacent_valid_reverse": projection.adjacent_valid_reverse.astype(bool),
+        "anchor_motion_adjacent_inlier_count_reverse": projection.adjacent_inlier_count_reverse.astype(np.int32),
+        "anchor_motion_adjacent_inlier_ratio_reverse": projection.adjacent_inlier_ratio_reverse.astype(np.float32),
+        "anchor_motion_adjacent_reprojection_error_mean_reverse": projection.adjacent_reprojection_error_mean_reverse.astype(np.float32),
+        "anchor_motion_adjacent_reprojection_error_median_reverse": projection.adjacent_reprojection_error_median_reverse.astype(np.float32),
+        "anchor_motion_mother_point": projection.mother_point.astype(np.float32),
     }
     if bundle.confidence is not None:
         track_arrays["confidence_reverse"] = bundle.confidence.astype(np.float32)
@@ -132,8 +121,12 @@ def write_window_artifacts(
 
     support_points = np.empty((0, 2), dtype=np.float32)
     if config.save_path_mask:
-        support_points = _reference_support_points(frames_rgb[0], config)
-        mask_rgba = reference_mask(bundle, h, w, queries, support_points=support_points)
+        mask_rgba = projection_mask(
+            projection,
+            h,
+            w,
+            radius_px=config.anchor_motion.path_radius_px,
+        )
         cv2.imwrite(
             str(window_dir / "path_mask_reference.png"),
             cv2.cvtColor(mask_rgba, cv2.COLOR_RGBA2BGRA),
@@ -159,18 +152,16 @@ def write_window_artifacts(
             "x_max_ratio": seed_x_max_ratio,
         },
         "tracker": bundle.tracker.to_json(),
+        "anchor_motion": projection_metadata(projection),
         "config": asdict(config),
         "path_support": {
-            "enabled": bool(config.path_support_enabled),
+            "enabled": False,
             "point_count": int(len(support_points)),
             "min_points": int(config.path_support_min_points),
             "fraction": int(config.path_support_fraction),
             "support_detector": {
-                "name": "sift",
-                "contrast_threshold": 0.006,
-                "edge_threshold": 24.0,
-                "n_octave_layers": 4,
-                "sigma": 1.2,
+                "name": None,
+                "reason": "footprint support points are disabled in the anchor-motion repo",
             },
         },
         "files": {

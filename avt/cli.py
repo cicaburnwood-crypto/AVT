@@ -67,9 +67,9 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--query-mode",
-        choices=("anchor_footprint", "footprint", "avt", "avt+footprint"),
+        choices=("anchor_motion", "anchor_footprint", "footprint", "avt", "avt+footprint"),
         default=None,
-        help="Query source mode. Defaults to YAML query_mode or anchor_footprint.",
+        help="Query source mode. Defaults to YAML query_mode or anchor_motion.",
     )
     parser.add_argument(
         "--query-config",
@@ -98,8 +98,8 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--path-support",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Use relaxed support points when drawing the reference path mask.",
+        default=False,
+        help="Legacy footprint support points are disabled in this anchor-motion repo.",
     )
     parser.add_argument("--path-support-min-points", type=int, default=32)
     parser.add_argument("--path-support-fraction", type=int, default=6)

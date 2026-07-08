@@ -87,8 +87,8 @@ class AnchorSamplingConfig:
     enabled: bool = True
     max_query_points: int = 384
     window_size: int | None = None
-    min_points_per_frame: int = 8
-    max_points_per_frame: int = 20
+    min_points_per_frame: int = 32
+    max_points_per_frame: int = 128
     n_octave_layers: int = 3
     contrast_threshold: float = 0.008
     edge_threshold: float = 15.0
@@ -119,7 +119,7 @@ class QuerySamplingConfig:
 class QueryConfig:
     """Top-level query source configuration."""
 
-    mode: str = "anchor_footprint"
+    mode: str = "anchor_motion"
     detector: str = "sift"
     footprint: FootprintConfig = field(default_factory=FootprintConfig)
     sampling: QuerySamplingConfig = field(default_factory=QuerySamplingConfig)
@@ -129,7 +129,7 @@ class QueryConfig:
 
     def __init__(
         self,
-        mode: str = "anchor_footprint",
+        mode: str = "anchor_motion",
         detector: str = "sift",
         footprint: FootprintConfig | None = None,
         sampling: QuerySamplingConfig | None = None,
@@ -160,8 +160,8 @@ def load_query_config_yaml(path: Path) -> QueryConfig:
 
 
 _DETECTORS = ("sift", "orb", "superpoint", "xfeat")
-QUERY_MODES = ("anchor_footprint", "footprint", "avt", "avt+footprint")
-DETECTOR_SAMPLING_MODES = ("anchor_footprint", "footprint", "avt+footprint")
+QUERY_MODES = ("anchor_motion", "anchor_footprint", "footprint", "avt", "avt+footprint")
+DETECTOR_SAMPLING_MODES = ("anchor_motion", "anchor_footprint", "footprint", "avt+footprint")
 
 
 def _validate_detector(name: str) -> str:
@@ -219,7 +219,7 @@ def _xfeat_config_from_mapping(data: dict[str, Any]) -> XFeatConfig:
 
 
 def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
-    mode = _validate_mode(str(data.get("query_mode", data.get("mode", "anchor_footprint"))))
+    mode = _validate_mode(str(data.get("query_mode", data.get("mode", "anchor_motion"))))
     robot_data = data.get("footprint", {}) or {}
     sampling_data = data.get("sampling", {}) or {}
     if not isinstance(robot_data, dict):
@@ -277,7 +277,7 @@ def query_config_from_mapping(data: dict[str, Any]) -> QueryConfig:
     if mode in DETECTOR_SAMPLING_MODES and not sampling.enabled:
         sampling = replace(sampling, enabled=True)
     if sampling.enabled and mode == "avt":
-        mode = "anchor_footprint"
+        mode = "anchor_motion"
     detector = _validate_detector(str(data.get("detector", "sift")))
     orb = _orb_config_from_mapping(data.get("orb", {}) or {})
     superpoint = _superpoint_config_from_mapping(data.get("superpoint", {}) or {})
@@ -310,7 +310,7 @@ def merge_query_config(
     if enable_sampling is not None:
         next_sampling = replace(next_sampling, enabled=enable_sampling)
         if enable_sampling and next_mode == "avt":
-            next_mode = "anchor_footprint"
+            next_mode = "anchor_motion"
     next_detector = _validate_detector(detector) if detector else base.detector
     return replace(
         base,
@@ -375,26 +375,35 @@ def build_footprint_queries(
     *,
     start_id: int = 0,
 ) -> list[QueryPoint]:
+    raise ValueError("footprint query points are disabled in the anchor-motion repo")
+
+
+def build_anchor_motion_queries(
+    frames_rgb: np.ndarray,
+    query_config: QueryConfig,
+    *,
+    start_id: int = 0,
+) -> list[QueryPoint]:
+    """Build last-frame full-image anchor queries for anchor-motion projection."""
+
     if frames_rgb.ndim != 4 or frames_rgb.shape[-1] != 3:
         raise ValueError("frames_rgb must have shape [T,H,W,3]")
-    if query_config.sampling.max_query_points <= 0:
-        raise ValueError("sampling max_query_points must be positive")
-    if query_config.sampling.window_size <= 0:
-        raise ValueError("sampling window_size must be positive")
+    if not query_config.sampling.enabled:
+        return []
 
-    frame_count, height, width = frames_rgb.shape[:3]
-    mask = robot_footprint_mask(height, width, query_config.footprint, query_config.sampling)
-    times = _sampling_times(frame_count, query_config.sampling.window_size)
+    anchors = query_config.sampling.anchors
+    if not anchors.enabled:
+        return []
     return _sample_detector_queries(
         frames_rgb=frames_rgb,
         query_config=query_config,
-        times=times,
-        max_query_points=query_config.sampling.max_query_points,
-        mask=mask,
-        params=query_config.sampling,
-        source="footprint",
+        times=[0],
+        max_query_points=anchors.max_query_points,
+        mask=None,
+        params=anchors,
+        source="anchor",
         start_id=start_id,
-        balance_full_mask=False,
+        balance_full_mask=True,
     )
 
 
@@ -404,49 +413,9 @@ def build_anchor_footprint_queries(
     *,
     start_id: int = 0,
 ) -> list[QueryPoint]:
-    """Build full-frame anchor + robot-footprint detector queries."""
+    """Compatibility alias: footprint points are disabled in this repo."""
 
-    if frames_rgb.ndim != 4 or frames_rgb.shape[-1] != 3:
-        raise ValueError("frames_rgb must have shape [T,H,W,3]")
-    if not query_config.sampling.enabled:
-        return []
-    if query_config.sampling.window_size <= 0:
-        raise ValueError("sampling window_size must be positive")
-
-    frame_count, height, width = frames_rgb.shape[:3]
-    queries: list[QueryPoint] = []
-    anchors = query_config.sampling.anchors
-    if anchors.enabled:
-        anchor_window = anchors.window_size or query_config.sampling.window_size
-        if anchor_window <= 0:
-            raise ValueError("sampling anchor window_size must be positive")
-        queries.extend(
-            _sample_detector_queries(
-                frames_rgb=frames_rgb,
-                query_config=query_config,
-                times=_sampling_times(frame_count, anchor_window),
-                max_query_points=anchors.max_query_points,
-                mask=None,
-                params=anchors,
-                source="anchor",
-                start_id=start_id + len(queries),
-                balance_full_mask=True,
-            )
-        )
-    queries.extend(
-        _sample_detector_queries(
-            frames_rgb=frames_rgb,
-            query_config=query_config,
-            times=_sampling_times(frame_count, query_config.sampling.window_size),
-            max_query_points=query_config.sampling.max_query_points,
-            mask=robot_footprint_mask(height, width, query_config.footprint, query_config.sampling),
-            params=query_config.sampling,
-            source="footprint",
-            start_id=start_id + len(queries),
-            balance_full_mask=False,
-        )
-    )
-    return queries
+    return build_anchor_motion_queries(frames_rgb, query_config, start_id=start_id)
 
 
 def _sample_detector_queries(
@@ -674,13 +643,13 @@ def _samples_per_time(
     base = int(max_query_points / time_count)
     min_points = max(1, int(params.min_points_per_frame))
     max_points = max(min_points, int(params.max_points_per_frame))
-    return max(min_points, min(max_points, base))
+    return min(max_query_points, max(min_points, min(max_points, base)))
 
 
 def _validate_mode(mode: str) -> str:
     if mode not in QUERY_MODES:
         raise ValueError(
-            "query_mode must be one of: anchor_footprint, footprint, avt, avt+footprint"
+            "query_mode must be one of: anchor_motion, anchor_footprint, footprint, avt, avt+footprint"
         )
     return mode
 
