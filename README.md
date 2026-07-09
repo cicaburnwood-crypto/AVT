@@ -8,6 +8,8 @@ separate pieces:
 
 - `avt/tracking/`: point tracker backends.
 - `avt/inverse.py`: reversed-video windowing, query seeding, and artifact export.
+- `avt/pipeline/filter.py`: optional post-tracking filters, including the
+  anchor-motion footprint filter.
 - `avt/viewer.py`: static WebUI builder that reads generic AVT artifacts.
 
 There are no runtime imports, symlinks, or path assumptions from any other local
@@ -185,9 +187,56 @@ footprint of the reference frame and used only to draw the mask. Disable support
 points with `--no-path-support`, or tune them with
 `--path-support-min-points` and `--path-support-fraction`.
 
+### Anchor-Motion Footprint Filter
+
+This repo adds an optional Stage 3.5 after tracking and before artifact export.
+It keeps the tracker/extractor interfaces unchanged:
+
+```text
+preprocess -> extract -> track -> anchor-motion filter -> combine
+```
+
+The default filter estimates adjacent-frame image motion from visible
+full-frame anchor tracks with affine RANSAC. It then compares each visible
+footprint track against that anchor-predicted position. The residual becomes an
+`anchor_motion_confidence`, which is multiplied with the tracker confidence to
+produce the final `confidence_reverse` used by the viewer and path mask.
+
+Anchors are not used as path points. They act as the motion reference frame for
+filtering footprint points.
+
+The filter is enabled by default in this experimental repo. Disable it or tune
+its thresholds from the CLI:
+
+```bash
+avt all \
+  --frames-root /path/to/images \
+  --query-mode anchor_footprint \
+  --no-anchor-motion-filter
+
+avt all \
+  --frames-root /path/to/images \
+  --query-mode anchor_footprint \
+  --anchor-motion-min-anchor-matches 8 \
+  --anchor-motion-min-final-confidence 0.25 \
+  --anchor-motion-residual-scale-px 8.0 \
+  --anchor-motion-fallback-confidence 1.0
+```
+
+Debug arrays are written into each `tracks.npz` when the filter runs:
+
+- `tracker_confidence_input_reverse`
+- `anchor_motion_confidence_reverse`
+- `anchor_motion_residual_px_reverse`
+
+`window.json` also contains a `tracking_postprocess.anchor_motion_filter`
+summary with per-transition inlier counts, reprojection errors, and filtered
+footprint counts.
+
 By default, each CLI run writes into a fresh child directory under
-`/home/wolfie/Project/Cyber_Guider/AVT/outputs`, for example
-`/home/wolfie/Project/Cyber_Guider/AVT/outputs/run_20260615_120501_123456`.
+`/home/wolfie/Project/Cyber_Guider/AVT_anchor_motion_filter/outputs`, for
+example
+`/home/wolfie/Project/Cyber_Guider/AVT_anchor_motion_filter/outputs/run_20260615_120501_123456`.
 Pass `--output-root` to use a different base directory. The command prints the
 resolved `output_root` when it finishes. Add `--build-viewer` if you want `avt
 all` to build the static WebUI immediately.

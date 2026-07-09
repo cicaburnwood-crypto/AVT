@@ -19,6 +19,11 @@ from .pipeline.combine import (
     write_window_artifacts,
 )
 from .pipeline.extract import PointExtractor, QueryPointExtractor, build_queries
+from .pipeline.filter import (
+    AnchorMotionFootprintFilter,
+    PointTrackFilter,
+    run_track_filter,
+)
 from .pipeline.preprocess import (
     PreparedWindow,
     _avt_seed_ratios,
@@ -33,6 +38,7 @@ __all__ = [
     "InverseTrackConfig",
     "PreparedWindow",
     "PointExtractor",
+    "PointTrackFilter",
     "QueryPointExtractor",
     "build_windows",
     "prepare_window",
@@ -51,8 +57,10 @@ def run_inverse_tracking(
     config: InverseTrackConfig,
     *,
     extractor: PointExtractor | None = None,
+    filterer: PointTrackFilter | None = None,
 ) -> list[WindowSpec]:
     extractor = extractor or QueryPointExtractor()
+    filterer = filterer or AnchorMotionFootprintFilter()
     source_root = source_root.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     windows = build_windows(len(frame_records), config)
@@ -69,6 +77,9 @@ def run_inverse_tracking(
         prepared = prepare_window(source_root, frame_records, window, config)   # Stage 1
         queries = extractor.extract(prepared, config)                          # Stage 2
         bundle = run_tracking(prepared, queries, tracker, output_dir)          # Stage 3
+        bundle = run_track_filter(                                             # Stage 3.5
+            prepared, queries, bundle, config, filterer
+        )
         write_window_artifacts(                                                # Stage 4
             output_dir, prepared.window, prepared.frames_rgb, queries, bundle, config
         )

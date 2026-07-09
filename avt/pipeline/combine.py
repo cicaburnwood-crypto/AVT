@@ -159,6 +159,7 @@ def write_window_artifacts(
             "x_max_ratio": seed_x_max_ratio,
         },
         "tracker": bundle.tracker.to_json(),
+        "tracking_postprocess": bundle.metadata,
         "config": asdict(config),
         "path_support": {
             "enabled": bool(config.path_support_enabled),

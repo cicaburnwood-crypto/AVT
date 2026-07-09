@@ -53,6 +53,18 @@ def _load_superpoint(config: SuperPointConfig):
     return _MODEL_CACHE[key]
 
 
+def _apply_superpoint_config(model, config: SuperPointConfig) -> None:
+    decoder = getattr(model, "keypoint_decoder", None)
+    if decoder is None:
+        return
+    decoder.keypoint_threshold = float(config.keypoint_threshold)
+    decoder.max_keypoints = int(config.max_keypoints)
+    model_config = getattr(model, "config", None)
+    if model_config is not None:
+        model_config.keypoint_threshold = float(config.keypoint_threshold)
+        model_config.max_keypoints = int(config.max_keypoints)
+
+
 def _load_superglue(config: SuperPointConfig):
     try:
         import torch  # noqa: F401
@@ -92,6 +104,7 @@ class SuperPointSuperGlueDetector:
         if self._sp_bundle is None:
             self._sp_bundle = _load_superpoint(self._config)
         processor, model, device = self._sp_bundle
+        _apply_superpoint_config(model, self._config)
 
         import torch
 

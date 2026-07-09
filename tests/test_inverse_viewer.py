@@ -204,6 +204,7 @@ def test_cli_output_defaults() -> None:
     assert viewer_args.viewer_dir == DEFAULT_VIEWER_ROOT
     assert track_args.save_reverse_video is False
     assert track_args.save_path_mask is False
+    assert track_args.anchor_motion_filter is True
     assert all_args.build_viewer is False
 
     debug_args = parser.parse_args(
@@ -219,6 +220,16 @@ def test_cli_output_defaults() -> None:
     assert debug_args.save_reverse_video is True
     assert debug_args.save_path_mask is True
     assert debug_args.build_viewer is True
+
+    no_filter_args = parser.parse_args(
+        [
+            "track",
+            "--frames-root",
+            "/tmp/frames",
+            "--no-anchor-motion-filter",
+        ]
+    )
+    assert no_filter_args.anchor_motion_filter is False
 
 
 def test_cli_accepts_foundationpose_backend() -> None:

@@ -62,7 +62,11 @@ class XFeatDetector:
         if self._model is None:
             self._model = _load_xfeat(self._config)
         frame = np.ascontiguousarray(frames_rgb[reverse_time])
-        output = self._model.detectAndCompute(frame, top_k=int(self._config.top_k))[0]
+        output = self._model.detectAndCompute(
+            frame,
+            top_k=int(self._config.top_k),
+            detection_threshold=float(self._config.detection_threshold),
+        )[0]
         kpts = output["keypoints"].detach().cpu().numpy()
         scores = output.get("scores")
         scores = (

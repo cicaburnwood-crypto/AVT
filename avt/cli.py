@@ -6,6 +6,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 
+from .config import AnchorMotionFilterConfig
 from .inverse import InverseTrackConfig, run_inverse_tracking
 from .io import read_frame_records
 from .querying import QueryConfig, load_query_config_yaml, merge_query_config
@@ -103,6 +104,20 @@ def _add_inverse_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--path-support-min-points", type=int, default=32)
     parser.add_argument("--path-support-fraction", type=int, default=6)
+    parser.add_argument(
+        "--anchor-motion-filter",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Filter footprint tracks with full-frame anchor motion consistency.",
+    )
+    parser.add_argument("--anchor-motion-min-anchor-matches", type=int, default=8)
+    parser.add_argument("--anchor-motion-min-anchor-inliers", type=int, default=6)
+    parser.add_argument("--anchor-motion-min-inlier-ratio", type=float, default=0.35)
+    parser.add_argument("--anchor-motion-ransac-reproj-threshold-px", type=float, default=4.0)
+    parser.add_argument("--anchor-motion-residual-scale-px", type=float, default=8.0)
+    parser.add_argument("--anchor-motion-min-motion-confidence", type=float, default=0.20)
+    parser.add_argument("--anchor-motion-min-final-confidence", type=float, default=0.25)
+    parser.add_argument("--anchor-motion-fallback-confidence", type=float, default=1.0)
 
 
 def _override(base, **kwargs):
@@ -166,6 +181,17 @@ def _config_from_args(args: argparse.Namespace) -> InverseTrackConfig:
         path_support_enabled=args.path_support,
         path_support_min_points=args.path_support_min_points,
         path_support_fraction=args.path_support_fraction,
+        anchor_motion_filter=AnchorMotionFilterConfig(
+            enabled=bool(args.anchor_motion_filter),
+            min_anchor_matches=args.anchor_motion_min_anchor_matches,
+            min_anchor_inliers=args.anchor_motion_min_anchor_inliers,
+            min_inlier_ratio=args.anchor_motion_min_inlier_ratio,
+            ransac_reproj_threshold_px=args.anchor_motion_ransac_reproj_threshold_px,
+            residual_scale_px=args.anchor_motion_residual_scale_px,
+            min_motion_confidence=args.anchor_motion_min_motion_confidence,
+            min_final_confidence=args.anchor_motion_min_final_confidence,
+            fallback_confidence=args.anchor_motion_fallback_confidence,
+        ),
     )
 
 
