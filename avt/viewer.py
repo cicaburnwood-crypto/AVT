@@ -74,6 +74,17 @@ def _window_payload(
     confidence = arrays["confidence_reverse"].astype(np.float32) if "confidence_reverse" in arrays else None
     if confidence is not None and confidence.shape != visibility.shape:
         raise ValueError(f"confidence_reverse shape {confidence.shape} does not match visibility shape {visibility.shape}")
+    rolling_mother = arrays["anchor_motion_rolling_mother_reverse"] if "anchor_motion_rolling_mother_reverse" in arrays else None
+    rolling_mother_scale = (
+        arrays["anchor_motion_rolling_mother_scale_reverse"]
+        if "anchor_motion_rolling_mother_scale_reverse" in arrays
+        else None
+    )
+    rolling_mother_valid = (
+        arrays["anchor_motion_rolling_mother_valid_reverse"].astype(bool)
+        if "anchor_motion_rolling_mother_valid_reverse" in arrays
+        else None
+    )
     queries = arrays["queries"]
     query_records = _query_records(arrays)
 
@@ -141,19 +152,45 @@ def _window_payload(
                 value = float(confidence[reverse_t, idx])
                 point.append(round(max(0.0, min(1.0, value)), 4) if np.isfinite(value) else None)
             points.append(point)
-        frames_out.append(
-            {
-                "frame": frame_idx,
-                "reverse_time": int(reverse_t),
-                "points": points,
-                "reliability": frame_reliability(
-                    frame_idx,
-                    points,
-                    unreliable_frame_indices=unreliable_frame_indices,
-                    frame_reasons=frame_reasons,
-                ),
-            }
-        )
+        frame_payload = {
+            "frame": frame_idx,
+            "reverse_time": int(reverse_t),
+            "points": points,
+            "reliability": frame_reliability(
+                frame_idx,
+                points,
+                unreliable_frame_indices=unreliable_frame_indices,
+                frame_reasons=frame_reasons,
+            ),
+        }
+        if (
+            rolling_mother is not None
+            and rolling_mother_valid is not None
+            and reverse_t < rolling_mother_valid.shape[0]
+        ):
+            mother_points = []
+            source_ids = np.flatnonzero(rolling_mother_valid[reverse_t, : reverse_t + 1])
+            for source_t in source_ids:
+                xy = rolling_mother[reverse_t, source_t]
+                if not np.isfinite(xy).all():
+                    continue
+                source_frame = seq_end - 1 - int(source_t)
+                scale = None
+                if rolling_mother_scale is not None:
+                    scale_value = float(rolling_mother_scale[reverse_t, source_t])
+                    if np.isfinite(scale_value):
+                        scale = round(scale_value, 4)
+                mother_points.append(
+                    [
+                        int(source_frame),
+                        round(float(xy[0]), 1),
+                        round(float(xy[1]), 1),
+                        scale,
+                    ]
+                )
+            mother_points.sort(key=lambda item: item[0])
+            frame_payload["mother_points"] = mother_points
+        frames_out.append(frame_payload)
 
     video_url = None
     reverse_video = meta["files"].get("reverse_video")

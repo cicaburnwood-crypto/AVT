@@ -16,6 +16,7 @@ import numpy as np
 
 from ..anchor_motion import (
     estimate_anchor_motion_projection,
+    estimate_rolling_mother_projection,
     projection_mask,
     projection_metadata,
 )
@@ -96,6 +97,12 @@ def write_window_artifacts(
         height=h,
         config=config.anchor_motion,
     )
+    rolling = estimate_rolling_mother_projection(
+        projection,
+        width=w,
+        height=h,
+        scale_radius_px=config.anchor_motion.mother_scale_radius_px,
+    )
     track_arrays = {
         "tracks_reverse": bundle.tracks.astype(np.float32),
         "visibility_reverse": bundle.visibility.astype(bool),
@@ -108,6 +115,10 @@ def write_window_artifacts(
         "anchor_motion_adjacent_reprojection_error_mean_reverse": projection.adjacent_reprojection_error_mean_reverse.astype(np.float32),
         "anchor_motion_adjacent_reprojection_error_median_reverse": projection.adjacent_reprojection_error_median_reverse.astype(np.float32),
         "anchor_motion_mother_point": projection.mother_point.astype(np.float32),
+        "anchor_motion_rolling_mother_reverse": rolling.points_reverse.astype(np.float32),
+        "anchor_motion_rolling_mother_scale_reverse": rolling.scale_reverse.astype(np.float32),
+        "anchor_motion_rolling_mother_valid_reverse": rolling.valid_reverse.astype(bool),
+        "anchor_motion_mother_scale_radius_px": np.array(float(rolling.scale_radius_px), dtype=np.float32),
     }
     if bundle.confidence is not None:
         track_arrays["confidence_reverse"] = bundle.confidence.astype(np.float32)
@@ -153,6 +164,14 @@ def write_window_artifacts(
         },
         "tracker": bundle.tracker.to_json(),
         "anchor_motion": projection_metadata(projection),
+        "rolling_mother_projection": {
+            "schema": "avt_rolling_mother_projection_v1",
+            "method": "anchor_affine_rolling_bottom_center_projection",
+            "time_order": "reverse current t receives source mother s when s <= t",
+            "scale_method": "projected left-right packet distance divided by source packet distance",
+            "scale_radius_px": float(rolling.scale_radius_px),
+            "visible_point_count": int(np.count_nonzero(rolling.valid_reverse)),
+        },
         "config": asdict(config),
         "path_support": {
             "enabled": False,

@@ -23,6 +23,14 @@ class AnchorMotionProjection:
     adjacent_reprojection_error_median_reverse: np.ndarray
 
 
+@dataclass(frozen=True)
+class RollingMotherProjection:
+    points_reverse: np.ndarray
+    scale_reverse: np.ndarray
+    valid_reverse: np.ndarray
+    scale_radius_px: float
+
+
 def estimate_anchor_motion_projection(
     bundle: TrackingBundle,
     queries: list[QueryPoint],
@@ -103,6 +111,92 @@ def estimate_anchor_motion_projection(
         adjacent_inlier_ratio_reverse=inlier_ratio,
         adjacent_reprojection_error_mean_reverse=error_mean,
         adjacent_reprojection_error_median_reverse=error_median,
+    )
+
+
+def estimate_rolling_mother_projection(
+    projection: AnchorMotionProjection,
+    width: int,
+    height: int,
+    *,
+    scale_radius_px: float = 16.0,
+) -> RollingMotherProjection:
+    """Project every per-frame mother point into every later reverse frame.
+
+    Reverse time grows backward in the original video. A source mother at
+    reverse time ``s`` is visible in current reverse time ``t`` only for
+    ``s <= t``. The transform is C_t @ inv(C_s), where C maps reverse time 0 to
+    the requested reverse frame.
+    """
+
+    frame_count = int(projection.transforms_reverse.shape[0])
+    points = np.full((frame_count, frame_count, 2), np.nan, dtype=np.float32)
+    scales = np.full((frame_count, frame_count), np.nan, dtype=np.float32)
+    valid = np.zeros((frame_count, frame_count), dtype=bool)
+
+    radius = max(1.0, float(scale_radius_px))
+    mother = projection.mother_point.astype(np.float64)
+    left = mother + np.array([-radius, 0.0], dtype=np.float64)
+    right = mother + np.array([radius, 0.0], dtype=np.float64)
+    left[0] = np.clip(left[0], 0.0, max(0, width - 1))
+    right[0] = np.clip(right[0], 0.0, max(0, width - 1))
+    source_width = float(np.linalg.norm(right - left))
+    if source_width <= 1e-6:
+        source_width = radius * 2.0
+
+    transforms = []
+    inverses = []
+    for t in range(frame_count):
+        if not bool(projection.valid_reverse[t]):
+            transforms.append(None)
+            inverses.append(None)
+            continue
+        matrix = projection.transforms_reverse[t]
+        if not np.isfinite(matrix).all():
+            transforms.append(None)
+            inverses.append(None)
+            continue
+        homogeneous = _to_homogeneous(matrix.astype(np.float64))
+        try:
+            inverse = np.linalg.inv(homogeneous)
+        except np.linalg.LinAlgError:
+            transforms.append(None)
+            inverses.append(None)
+            continue
+        transforms.append(homogeneous)
+        inverses.append(inverse)
+
+    for current_t in range(frame_count):
+        current = transforms[current_t]
+        if current is None:
+            continue
+        for source_t in range(current_t + 1):
+            source_inv = inverses[source_t]
+            if source_inv is None:
+                continue
+            source_to_current = current @ source_inv
+            center_xy = _project_point(source_to_current, mother)
+            if not np.isfinite(center_xy).all():
+                continue
+            x, y = float(center_xy[0]), float(center_xy[1])
+            if x < 0.0 or x > width - 1 or y < 0.0 or y > height - 1:
+                continue
+
+            left_xy = _project_point(source_to_current, left)
+            right_xy = _project_point(source_to_current, right)
+            scale = np.linalg.norm(right_xy - left_xy) / source_width
+            if not np.isfinite(scale):
+                continue
+
+            points[current_t, source_t] = center_xy.astype(np.float32)
+            scales[current_t, source_t] = float(scale)
+            valid[current_t, source_t] = True
+
+    return RollingMotherProjection(
+        points_reverse=points,
+        scale_reverse=scales,
+        valid_reverse=valid,
+        scale_radius_px=radius,
     )
 
 

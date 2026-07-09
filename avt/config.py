@@ -13,6 +13,7 @@ class AnchorMotionConfig:
     mother_x_ratio: float = 0.5
     mother_y_ratio: float = 1.0
     path_radius_px: int = 6
+    mother_scale_radius_px: float = 16.0
 
 
 @dataclass

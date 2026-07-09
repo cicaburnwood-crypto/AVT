@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from avt.anchor_motion import estimate_anchor_motion_projection
+from avt.anchor_motion import estimate_anchor_motion_projection, estimate_rolling_mother_projection
 from avt.cli import (
     DEFAULT_OUTPUT_ROOT,
     DEFAULT_VIEWER_ROOT,
@@ -101,6 +101,55 @@ def test_anchor_motion_projects_mother_point_from_affine_tracks() -> None:
     )
     assert projection.valid_reverse.tolist() == [True, True, True, True]
     assert np.allclose(projection.projected_points_reverse, expected, atol=1e-3)
+
+
+def test_rolling_mother_projection_casts_each_source_into_current_frame() -> None:
+    base = np.array(
+        [
+            [10.0, 10.0],
+            [30.0, 10.0],
+            [10.0, 30.0],
+            [30.0, 30.0],
+            [20.0, 18.0],
+            [35.0, 25.0],
+        ],
+        dtype=np.float32,
+    )
+    frame_count = 4
+    tracks = np.zeros((frame_count, len(base), 2), dtype=np.float32)
+    for t in range(frame_count):
+        tracks[t] = base + np.array([2.0 * t, -3.0 * t], dtype=np.float32)
+    bundle = TrackingBundle(
+        tracks=tracks,
+        visibility=np.ones((frame_count, len(base)), dtype=bool),
+        tracker=TrackerInfo(name="fake"),
+    )
+    queries = [
+        QueryPoint(id=i, reverse_time=0, x=float(x), y=float(y), side=-1, source="anchor")
+        for i, (x, y) in enumerate(base)
+    ]
+
+    projection = estimate_anchor_motion_projection(
+        bundle,
+        queries,
+        width=100,
+        height=100,
+        config=AnchorMotionConfig(min_matches=4),
+    )
+    rolling = estimate_rolling_mother_projection(
+        projection,
+        width=100,
+        height=100,
+        scale_radius_px=10.0,
+    )
+
+    mother = np.array([49.5, 99.0], dtype=np.float32)
+    assert rolling.valid_reverse[3, 0]
+    assert rolling.valid_reverse[3, 3]
+    assert not rolling.valid_reverse[1, 2]
+    assert np.allclose(rolling.points_reverse[3, 0], mother + [6.0, -9.0], atol=1e-3)
+    assert np.allclose(rolling.points_reverse[3, 3], mother, atol=1e-3)
+    assert np.isclose(rolling.scale_reverse[3, 0], 1.0, atol=1e-3)
 
 
 def write_frames(root: Path, count: int = 6) -> None:
@@ -479,6 +528,9 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
     assert arrays["confidence_reverse"].dtype == np.float32
     assert set(arrays["query_source_codes"].tolist()) == {2}
     assert "anchor_motion_projected_mother_reverse" in arrays
+    assert "anchor_motion_rolling_mother_reverse" in arrays
+    assert "anchor_motion_rolling_mother_scale_reverse" in arrays
+    assert "anchor_motion_rolling_mother_valid_reverse" in arrays
 
     viewer_dir = tmp_path / "viewer"
     payload = build_viewer(frames_root, records, output_root, viewer_dir)
@@ -493,6 +545,8 @@ def test_inverse_tracking_and_viewer(tmp_path: Path) -> None:
     assert segment["point_columns"] == ["id", "x", "y", "confidence"]
     assert len(segment["frames"][0]["points"][0]) == 4
     assert 0.0 <= segment["frames"][0]["points"][0][3] <= 1.0
+    assert "mother_points" in segment["frames"][0]
+    assert len(segment["frames"][0]["mother_points"][0]) == 4
     assert segment["frames"][0]["reliability"]["segment_id"] == 0
     assert segment["frames"][0]["reliability"]["segment_unreliable"] is False
     assert segment["frames"][0]["reliability"]["segment_disabled"] is False
